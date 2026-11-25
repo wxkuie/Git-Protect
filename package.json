@@ -1,0 +1,33 @@
+{
+  "name": "git-protect",
+  "version": "0.8.12",
+  "description": "Windows 托盘工具：监视指定的 Git 仓库，等你停手后提醒或自动提交，免得忘了提交把改动攒丢。",
+  "license": "MIT",
+  "type": "module",
+  "main": "electron/main.mjs",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wxkuie/Git-Protect.git"
+  },
+  "bugs": {
+    "url": "https://github.com/wxkuie/Git-Protect/issues"
+  },
+  "homepage": "https://github.com/wxkuie/Git-Protect#readme",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check": "node --check 工具/git-guard/guard.mjs",
+    "test": "node scripts/test.mjs",
+    "guard": "node 工具/git-guard/guard.mjs",
+    "panel": "node 工具/git-guard/panel.mjs",
+    "app": "electron .",
+    "package": "node scripts/package.mjs",
+    "installer": "node scripts/pack-installer.mjs",
+    "icon": "electron scripts/make-icon.mjs"
+  },
+  "devDependencies": {
+    "@electron/packager": "^20.3.0",
+    "electron": "^45.4.1"
+  }
+}

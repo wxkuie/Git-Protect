@@ -1,0 +1,9 @@
+{
+  "root": "C:/code",
+  "branch": "",
+  "idleSeconds": 600,
+  "pollSeconds": 30,
+  "cooldownSeconds": 7200,
+  "message": "保存本地修改",
+  "projects": []
+}

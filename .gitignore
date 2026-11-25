@@ -1,0 +1,15 @@
+/node_modules/
+/.tmp/
+/.local/
+/工具/git-guard/.state/
+/工具/git-guard/state/
+/工具/git-guard/config.json
+/dist/
+/out/
+*.log
+
+Thumbs.db
+Desktop.ini
+.DS_Store
+/.state/
+.demo/

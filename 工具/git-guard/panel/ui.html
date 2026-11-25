@@ -1,0 +1,928 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Git 静默提交助手</title>
+<style>
+  :root {
+    --line: #dfe3e8; --text: #1f2328; --muted: #6b7280; --bg: #ffffff; --soft: #f6f7f9;
+    --accent: #2563eb; --accent-weak: #eef4ff;
+    --ok: #15803d; --ok-weak: #ecfdf3; --warn: #b45309; --warn-weak: #fffbeb;
+    --danger: #b91c1c;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif;
+    font-size: 13px; display: grid; place-items: stretch center; overflow: hidden;
+  }
+  .app {
+    width: 660px; max-width: 100vw; height: 100vh;
+    display: flex; flex-direction: column; background: var(--bg); overflow: hidden;
+  }
+  .stat { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .sdot { width: 7px; height: 7px; border-radius: 50%; background: #b6bcc5; }
+  .sdot.on { background: #16a34a; box-shadow: 0 0 0 3px rgba(22,163,74,.15); }
+  .sdot.bad { background: #dc2626; box-shadow: 0 0 0 3px rgba(220,38,38,.15); }
+  .tabs { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; padding: 0 12px 0 8px; background: var(--soft); border-bottom: 1px solid var(--line); }
+  .tabs .tspacer { flex: 1; }
+  .tabs button {
+    border: none; background: none; padding: 7px 14px 6px; font-size: 13px; font-family: inherit;
+    color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; font-weight: 500;
+  }
+  .tabs button:hover { color: var(--text); }
+  .tabs button.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+  .body { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+  .pane { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 12px 14px 16px; }
+  .pane[hidden] { display: none !important; }
+  .pane.logpane { display: flex; flex-direction: column; overflow: hidden; }
+  .panehead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .panehead .h { font-size: 12px; color: var(--muted); }
+  .footer {
+    flex: 0 0 52px; height: 52px; display: flex; align-items: center; gap: 8px;
+    padding: 0 14px; background: var(--soft); border-top: 1px solid var(--line);
+  }
+  .footer .spacer { flex: 1; }
+  .msg { font-size: 12px; color: var(--muted); }
+  .msg.ok { color: var(--ok); } .msg.err { color: var(--danger); }
+  button {
+    font-family: inherit; font-size: 12.5px; font-weight: 500; padding: 6px 14px; border-radius: 6px;
+    border: 1px solid #ccd2da; background: #fff; color: var(--text); cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #f4f6f8; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.primary:hover:not(:disabled) { background: #1d4ed8; }
+  button.small { padding: 4px 10px; font-size: 12px; }
+  button:disabled { opacity: .45; cursor: default; }
+  input[type=text], input[type=number] {
+    width: 100%; padding: 6px 9px; font-size: 12.5px; font-family: inherit; color: var(--text);
+    border: 1px solid #ccd2da; border-radius: 5px; background: #fff;
+  }
+  input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-weak); }
+  input::placeholder { color: #b0b6bf; }
+  select {
+    padding: 5px 8px; font-size: 12.5px; font-family: inherit; color: var(--text);
+    border: 1px solid #ccd2da; border-radius: 5px; background: #fff;
+  }
+  select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-weak); }
+  .pl2 select { padding: 3px 6px; font-size: 12px; }
+  .pl2 select.selbranch { width: 108px; }
+  .field { margin-bottom: 12px; }
+  .field > label { display: block; font-size: 12px; color: #4b5563; margin-bottom: 4px; font-weight: 500; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .projlist { list-style: none; margin: 0; padding: 0; }
+  .proj { border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; background: #fff; }
+  .proj.off { background: #fafbfc; }
+  .pl1 { display: flex; align-items: center; gap: 8px; }
+  .ppath { flex: 1; font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+  .ppath bdi { direction: ltr; }
+  .x { border: none; background: none; color: #9aa1ab; font-size: 15px; line-height: 1; padding: 0 2px; cursor: pointer; }
+  .x:hover { color: var(--danger); background: none; }
+  .pl2 { display: flex; align-items: center; gap: 10px; margin-top: 7px; flex-wrap: wrap; }
+  .pl2 .f { display: flex; align-items: center; gap: 5px; }
+  .pl2 .f span { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+  .pl2 input[type=text], .pl2 input[type=number] { width: 92px; padding: 3px 6px; font-size: 12px; }
+  .pl2 input[type=number] { width: 56px; text-align: right; }
+  .chk { display: flex; align-items: center; gap: 4px; font-size: 11.5px; color: var(--muted); cursor: pointer; }
+  .pill { font-size: 11px; padding: 1px 7px; border-radius: 9px; white-space: nowrap; font-weight: 500; }
+  .pill.ok { background: var(--ok-weak); color: var(--ok); }
+  .pill.warn { background: var(--warn-weak); color: var(--warn); }
+  .pill.off { background: #f1f3f5; color: var(--muted); }
+  .empty { color: var(--muted); font-size: 12.5px; padding: 18px 4px; text-align: center; }
+  .note { margin: 10px 0 0; font-size: 11.5px; color: var(--muted); line-height: 1.5; }
+  pre.log {
+    margin: 0; padding: 10px 12px; background: #0f172a; color: #cbd5e1; border-radius: 6px;
+    font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; line-height: 1.6;
+    white-space: pre-wrap; word-break: break-all; flex: 1 1 auto; min-height: 0; overflow: auto;
+  }
+  .curbr {
+    font-size: 11px; color: var(--muted); background: #f1f3f5; border-radius: 4px;
+    padding: 1px 6px; white-space: nowrap; max-width: 130px; overflow: hidden; text-overflow: ellipsis;
+  }
+  .overlay { position: fixed; inset: 0; background: rgba(16,24,40,.38); display: grid; place-items: center; z-index: 20; }
+  .overlay[hidden] { display: none; }
+  .dialog { width: 520px; max-width: 92vw; max-height: 78vh; display: flex; flex-direction: column; background: #fff; border-radius: 8px; box-shadow: 0 18px 50px rgba(16,24,40,.3); overflow: hidden; }
+  .dialog h3 { margin: 0; padding: 12px 16px; font-size: 13px; border-bottom: 1px solid var(--line); background: var(--soft); }
+  .dialog .dbody { padding: 14px 16px; overflow-y: auto; }
+  .dialog .dfoot { padding: 10px 16px; border-top: 1px solid var(--line); text-align: right; background: var(--soft); }
+  .foundrow { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); }
+  .foundrow:last-child { border-bottom: none; }
+  .foundrow .fp { flex: 1; font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+  .pickrow { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .pickrow #dlgPick { flex: 0 0 auto; }
+  .listhead { display: flex; align-items: center; justify-content: space-between; margin: 6px 0; }
+  .foundrow input[type=checkbox] { margin: 0; }
+  .manual { margin-top: 10px; }
+  .manual summary { cursor: pointer; color: var(--muted); font-size: 12px; outline: none; }
+  .prow { display: flex; gap: 8px; margin-top: 6px; }
+  .prow input { flex: 1; }
+  .linkbtn { border: none; background: none; color: var(--accent); cursor: pointer; font-size: 12px; padding: 0 2px; text-decoration: underline; }
+  .linkbtn:hover { color: #1d4ed8; }
+  .evlist { list-style: none; margin: 0; padding: 0; max-height: 148px; overflow-y: auto; font-size: 12px; }
+  .evlist li { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--line); color: #374151; }
+  .evlist li:last-child { border-bottom: none; }
+  .evlist .t { color: var(--muted); white-space: nowrap; font-size: 11.5px; }
+  .evlist .r { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; }
+  .evlist .bad { color: var(--danger); }
+  .evlist .good { color: var(--ok); }
+  .evlist .m { color: var(--muted); white-space: nowrap; }
+  .sep { height: 1px; background: var(--line); margin: 12px 0; }
+  .hintline { font-size: 11.5px; color: var(--muted); margin: 6px 0 10px; line-height: 1.5; }
+  .hintline[hidden] { display: none; }
+  /* 上半是项目列表，自己滚；下半固定一个区块放设置，占窗口两成多，不跟着内容跑 */
+  .pane.projpane { display: flex; flex-direction: column; overflow: hidden; padding: 12px 14px 0; }
+  .projscroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; padding-right: 4px; }
+  /* 一次性配置：一行装下，放顶部当作用域说明；不给它整块版面 */
+  .toolbar {
+    flex: 0 0 auto; display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    padding: 7px 0 8px; margin-bottom: 2px; border-bottom: 1px solid var(--line);
+    font-size: 12px; color: var(--muted);
+  }
+  .toolbar .tb { font-size: 12px; color: #4b5563; }
+  .toolbar .tbmode { padding: 3px 6px; font-size: 12px; }
+  .toolbar .tbn { width: 54px; padding: 3px 6px; font-size: 12px; text-align: right; }
+  .toolbar .tbunit { font-size: 12px; color: var(--muted); }
+  .toolbar .tbspring { flex: 1 1 auto; min-width: 8px; }
+  .toolbar .chk { font-size: 11.5px; }
+  .toolbar .tbnone { flex-basis: 100%; font-size: 11.5px; color: var(--warn); }
+  /* 滚动条：不自己画一条，很多人就不知道这里能滚 */
+  .projscroll::-webkit-scrollbar, .evlist::-webkit-scrollbar,
+  pre.log::-webkit-scrollbar, .dialog .dbody::-webkit-scrollbar { width: 9px; }
+  .projscroll::-webkit-scrollbar-thumb, .evlist::-webkit-scrollbar-thumb,
+  pre.log::-webkit-scrollbar-thumb, .dialog .dbody::-webkit-scrollbar-thumb {
+    background: #ccd2da; border-radius: 5px; border: 2px solid #fff;
+  }
+  .projscroll::-webkit-scrollbar-thumb:hover, .evlist::-webkit-scrollbar-thumb:hover,
+  pre.log::-webkit-scrollbar-thumb:hover { background: #b0b8c3; }
+  .projscroll::-webkit-scrollbar-track, .evlist::-webkit-scrollbar-track,
+  pre.log::-webkit-scrollbar-track { background: transparent; }
+
+  /* 环境自查：没配齐时挡住整个界面 */
+  .blocker { position: fixed; inset: 0; z-index: 60; background: rgba(15,23,42,.45); display: grid; place-items: center; padding: 24px; }
+  .blocker[hidden] { display: none; }
+  .bcard { width: 520px; max-width: 100%; background: #fff; border-radius: 12px; box-shadow: 0 18px 48px rgba(15,23,42,.28); overflow: hidden; }
+  .bhead { padding: 20px 22px 14px; border-bottom: 1px solid var(--line); }
+  .btitle { font-size: 16px; font-weight: 700; letter-spacing: .2px; }
+  .bdesc { margin: 8px 0 0; font-size: 12px; line-height: 1.7; color: var(--muted); }
+  .blist { list-style: none; margin: 0; padding: 6px 22px 4px; }
+  .bitem { display: flex; gap: 10px; padding: 12px 0; border-bottom: 1px solid #f0f2f5; }
+  .bitem:last-child { border-bottom: 0; }
+  .bmark { flex: 0 0 18px; height: 18px; border-radius: 50%; display: grid; place-items: center; font-size: 11px; font-weight: 700; color: #fff; background: #dc2626; margin-top: 1px; }
+  .bmark.ok { background: #16a34a; }
+  .bmain { flex: 1; min-width: 0; }
+  .bname { font-weight: 600; font-size: 13px; }
+  .bdetail { color: var(--muted); font-size: 12px; margin-top: 3px; line-height: 1.6; word-break: break-word; }
+  .bacts { margin-top: 8px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .bprog { font-size: 12px; color: var(--muted); }
+  .bprog.ok { color: var(--ok); }
+  .bprog.err { color: var(--danger); }
+  .bcmd { margin-top: 8px; background: #f6f7f9; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-family: Consolas, monospace; font-size: 11.5px; color: #334155; white-space: pre-wrap; word-break: break-all; }
+  .bfoot { display: flex; align-items: center; gap: 8px; padding: 14px 22px 18px; background: #fafbfc; border-top: 1px solid var(--line); }
+  .bfoot .bspring { flex: 1; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="tabs" id="tabs">
+    <button data-tab="projects" class="active">项目</button>
+    <button data-tab="log">日志</button>
+    <span class="tspacer"></span>
+    <span class="stat"><span class="sdot" id="sdot"></span><span id="sText">未运行</span></span>
+  </div>
+
+  <div class="body">
+    <section class="pane projpane" data-pane="projects">
+      <div class="toolbar">
+        <label for="mode" class="tb">模式</label>
+        <select id="mode" class="tbmode">
+          <option value="remind">弹窗提醒</option>
+          <option value="notify">自动提交并通知</option>
+          <option value="silent">完全静默提交</option>
+        </select>
+        <label for="idleMinutes" class="tb">停手</label>
+        <input type="number" id="idleMinutes" min="1" max="1440" class="tbn">
+        <span class="tbunit">分钟后处理</span>
+        <span class="tbspring"></span>
+        <label class="chk"><input type="checkbox" id="autoStart"> 开机自启动</label>
+        <span class="tbnone" id="autoStartNote" hidden></span>
+      </div>
+      <div class="panehead">
+        <span class="h" id="projCount">0 个项目</span>
+        <button class="small" id="addOpen">添加项目</button>
+      </div>
+      <div class="projscroll" id="projScroll">
+        <ul class="projlist" id="projList"></ul>
+        <p class="note" id="fallbackNote"></p>
+      </div>
+
+    </section>
+
+
+    <section class="pane logpane" data-pane="log" hidden>
+      <div class="panehead">
+        <span class="h">自动提交记录</span>
+        <button class="small" id="logBtn">刷新</button>
+      </div>
+      <ul class="evlist" id="evList"></ul>
+      <div class="panehead" style="margin-top:12px">
+        <span class="h">监视输出</span>
+      </div>
+      <pre class="log" id="log">（暂无日志）</pre>
+    </section>
+  </div>
+
+  <div class="footer">
+    <button id="toggleMonitor">启动监视</button>
+    <span class="spacer"></span>
+    <span class="msg" id="msg"></span>
+    <button id="cancel">取消</button>
+    <button class="primary" id="save">保存</button>
+  </div>
+</div>
+
+<div class="overlay" id="overlay" hidden>
+  <div class="dialog">
+    <h3>添加项目</h3>
+    <div class="dbody">
+      <div class="pickrow">
+        <button id="dlgPick">选择文件夹…</button>
+        <button class="small" id="dlgScan">重新扫描</button>
+      </div>
+      <p class="hintline" id="dlgPickHint">选一个文件夹，工具会把里面所有的 Git 仓库找出来，勾选后一次加完。</p>
+      <p class="hintline" id="dlgMsg"></p>
+      <div class="listhead" id="dlgListHead" hidden>
+        <span class="h" id="dlgListTitle"></span>
+        <button class="small" id="dlgAll">全选</button>
+      </div>
+      <div id="dlgList"><div class="empty">还没选文件夹</div></div>
+      <details class="manual">
+        <summary>手动填一个路径</summary>
+        <div class="prow">
+          <input type="text" id="dlgPath" placeholder="C:\code\my-project">
+          <button class="small" id="dlgAddPath">添加</button>
+        </div>
+        <p class="hintline">能加的是 Git 仓库的根目录。刚 git init、还没有任何提交的目录也能加。如果目录还没建 Git，先在这个目录里执行 git init 再来。</p>
+      </details>
+    </div>
+    <div class="dfoot">
+      <button id="dlgAddSel" class="primary" disabled>添加选中</button>
+      <button id="dlgClose">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="blocker" id="blocker" hidden>
+  <div class="bcard">
+    <div class="bhead">
+      <div class="btitle">先补齐运行环境</div>
+      <p class="bdesc">这个工具要用到下面几项。缺的可以直接下载安装包，装好后回来点「重新检测」。</p>
+    </div>
+    <ul class="blist" id="blockerList"></ul>
+    <div class="bfoot">
+      <button id="recheck" class="small">重新检测</button>
+      <span class="bspring"></span>
+      <span class="bprog" id="bstatus"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+  var state = { dirty: false, monitor: null, projects: [], server: [], discovered: [], branches: {}, scanned: false, defaults: null, pickedRoot: '', selected: {}, lastEventTime: '' };
+
+  function el(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+  function keyp(p) { return String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase(); }
+  function setMsg(text, kind) { var n = el('msg'); n.textContent = text || ''; n.className = 'msg' + (kind ? ' ' + kind : ''); }
+
+  function serverFor(path) {
+    for (var i = 0; i < state.server.length; i++) if (keyp(state.server[i].path) === keyp(path)) return state.server[i];
+    return null;
+  }
+
+  function pill(p, st) {
+    if (!p.enabled) return '<span class="pill off">已停用</span>';
+    if (!st) return '<span class="pill off">未检测</span>';
+    if (st.gate) return '<span class="pill warn" title="上次提交做到一半中断了，需要先清理才能继续">提交未收尾</span>';
+    if (st.error) return '<span class="pill warn">' + esc(st.error) + '</span>';
+    if (st.identityOk === false) return '<span class="pill warn" title="提交需要 git 用户名和邮箱">未配 git 身份</span>';
+    if (st.branchOk === false) return '<span class="pill warn">分支不符</span>';
+    if (st.changes > 0) return '<span class="pill warn">' + st.changes + ' 个待提交</span>';
+    if (st.reachable) return '<span class="pill ok">干净</span>';
+    return '<span class="pill off">未检测</span>';
+  }
+
+  async function fixGate(i) {
+    var p = state.projects[i];
+    if (!p) return;
+    try {
+      var report = await api('/api/recover', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: p.path })
+      });
+      if (!report.canClear) { setMsg('现在不能自动处理：' + report.reason, 'err'); return; }
+      if (!window.confirm(report.reason + '\n\n清理只删掉这次没做完的收尾文件，并把相关路径的索引对齐到当前提交，不会动你工作区里的文件。继续吗？')) return;
+      await api('/api/recover', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: p.path, clear: true })
+      });
+      setMsg('已清理，可以继续提交了', 'ok');
+      loadAll();
+    } catch (e) { setMsg(e.message, 'err'); }
+  }
+
+  function branchSelect(p) {
+    var info = state.branches[keyp(p.path)] || { current: '', branches: [] };
+    var list = (info.branches || []).slice();
+    if (p.branch && list.indexOf(p.branch) < 0) list.push(p.branch);
+    var html = '<option value=""' + (p.branch ? '' : ' selected') + '>跟随当前</option>';
+    for (var i = 0; i < list.length; i++) {
+      html += '<option value="' + esc(list[i]) + '"' + (list[i] === p.branch ? ' selected' : '') + '>' + esc(list[i]) + '</option>';
+    }
+    return html;
+  }
+
+  var MODE_TEXT = { remind: '弹窗提醒', notify: '自动提交并通知', silent: '完全静默提交' };
+
+  function renderProjects() {
+    var list = el('projList');
+    el('projCount').textContent = state.projects.length + ' 个项目';
+    if (!state.projects.length) {
+      list.innerHTML = '<li class="empty">还没有项目<br>点右上角「添加项目」</li>';
+      return;
+    }
+    // 这行原本按模式写不同的说明，但它读的是加载时的默认值，改了模式不会跟着变，
+    // 出现过「选的是自动提交、说明却说会弹窗」的自相矛盾。说明文字干脆不写了。
+    el('fallbackNote').textContent = '';
+    list.innerHTML = state.projects.map(function (p, i) {
+      var st = serverFor(p.path);
+      var cur = st && st.currentBranch ? '<span class="curbr" title="当前分支">' + esc(st.currentBranch) + '</span>' : '';
+      return '<li class="proj' + (p.enabled ? '' : ' off') + '" data-i="' + i + '">'
+        + '<div class="pl1">'
+        +   '<span class="ppath" title="' + esc(p.path) + '"><bdi>' + esc(p.path) + '</bdi></span>'
+        +   cur
+        +   '<button class="x" data-del="' + i + '" title="移除">&times;</button>'
+        + '</div>'
+        + '<div class="pl2">'
+        +   '<label class="f"><span>分支</span><select class="selbranch" data-f="branch">' + branchSelect(p) + '</select></label>'
+        +   '<label class="chk"><input type="checkbox" data-f="enabled"' + (p.enabled ? ' checked' : '') + '> 启用</label>'
+        +   pill(p, st)
+        +   (st && st.gate ? '<button class="linkbtn" data-gate="' + i + '">处理</button>' : '')
+        + '</div></li>';
+    }).join('');
+  }
+
+  function pendingRepos() {
+    return state.discovered.filter(function (r) {
+      return !state.projects.some(function (p) { return keyp(p.path) === keyp(r.repo); });
+    });
+  }
+
+  function updateAddSel() {
+    var n = Object.keys(state.selected).filter(function (k) { return state.selected[k]; }).length;
+    var btn = el('dlgAddSel');
+    btn.disabled = n === 0;
+    btn.textContent = n ? '添加选中（' + n + '）' : '添加选中';
+  }
+
+  function renderFound() {
+    var box = el('dlgList'), head = el('dlgListHead');
+    if (!state.scanned) { head.hidden = true; box.innerHTML = '<div class="empty">还没选文件夹</div>'; updateAddSel(); return; }
+    var pending = pendingRepos();
+    if (!pending.length) { head.hidden = true; box.innerHTML = '<div class="empty">这个文件夹里没有可添加的仓库</div>'; updateAddSel(); return; }
+    head.hidden = false;
+    el('dlgListTitle').textContent = '找到 ' + pending.length + ' 个仓库';
+    box.innerHTML = pending.map(function (r) {
+      var on = state.selected[keyp(r.repo)] ? ' checked' : '';
+      return '<label class="foundrow"><input type="checkbox" data-sel="' + esc(r.repo) + '"' + on + '>'
+        + '<span class="fp" title="' + esc(r.repo) + '"><bdi>' + esc(r.repo) + '</bdi></span>'
+        + '<span class="pill off">' + esc(r.branch || '未知') + '</span></label>';
+    }).join('');
+    updateAddSel();
+  }
+
+  function fillForm(c) {
+    el('mode').value = c.mode || 'remind';
+    el('autoStart').checked = !!c.autoStart;
+    // 秒是内部单位，界面按分钟填：让人自己除以 60 纯属添乱
+    el('idleMinutes').value = Math.max(1, Math.round((c.idleSeconds || 600) / 60));
+  }
+
+  // 浏览器模式没有改系统自启动的能力，如实禁用，不做成「点了没反应」
+  function applyAutoStartUi() {
+    var box = el('autoStart'), note = el('autoStartNote');
+    if (state.autoStartSupported) {
+      box.disabled = false;
+      note.textContent = '';
+      note.hidden = true;
+    } else {
+      // 只有「做不到」才写一行，做得到就不留说明文字
+      box.disabled = true;
+      note.textContent = '浏览器模式改不了开机自启动，要用桌面版（启动窗口.cmd 或安装版）。';
+      note.hidden = false;
+    }
+  }
+
+  function readForm() {
+    return {
+      // 模式、停手时长都是全局的：一个项目设一次纯属增加点击
+      mode: el('mode').value,
+      idleSeconds: Math.round(Number(el('idleMinutes').value) * 60),
+      projects: state.projects.map(function (p) {
+        return { path: p.path, enabled: p.enabled, branch: p.branch };
+      })
+    };
+  }
+
+  function renderMonitor() {
+    var m = state.monitor || {};
+    var failed = !m.running && m.lastExit && m.lastExit.code !== 0;
+    el('sdot').className = 'sdot' + (m.running ? ' on' : (failed ? ' bad' : ''));
+    el('sText').textContent = m.running ? '监视中' : (failed ? '监视异常退出' : '已停止');
+    el('sText').title = failed ? '看「日志」标签页里的原因' : '';
+    el('toggleMonitor').textContent = m.running ? '停止监视' : '开始监视';
+    el('toggleMonitor').disabled = false;
+  }
+
+  async function api(path, options) {
+    var res = await fetch(path, options);
+    var data = null;
+    try { data = await res.json(); } catch (e) { data = {}; }
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    return data;
+  }
+
+  async function loadAll() {
+    try {
+      var s = await api('/api/status');
+      state.defaults = s.defaults;
+      if (!state.dirty) {
+        fillForm(s.config);
+        state.projects = (s.config.projects || []).map(function (p) { return Object.assign({}, p); });
+        renderProjects();
+      }
+      state.monitor = s.monitor;
+      state.embedded = !!s.embedded;
+      state.autoStartSupported = !!s.autoStartSupported;
+      applyAutoStartUi();
+      renderMonitor();
+
+      var events = s.autoCommits || [];
+      state.autoCommits = events;
+      renderEvents();
+      var newest = events[0];
+      if (newest && newest.time) {
+        if (!state.lastEventTime) state.lastEventTime = newest.time;
+        else if (newest.time > state.lastEventTime) {
+          state.lastEventTime = newest.time;
+          if (newest.commit && newest.mode === 'notify') {
+            // 系统通知由主进程发（窗口收进托盘也照发），这里只留窗口里的那行提示
+            setMsg('已自动提交 ' + (newest.count || 0) + ' 个文件 · ' + String(newest.commit).slice(0, 7), 'ok');
+          }
+        }
+      }
+    } catch (e) { setMsg('读取失败：' + e.message, 'err'); }
+    try {
+      var r = await api('/api/projects');
+      state.server = r.projects || [];
+      if (!state.dirty) renderProjects();
+    } catch (e) {}
+  }
+
+  // 系统通知不在这里发：主进程盯着提交记录，窗口关着也会提示（见 electron/notify.mjs）
+
+  // 记录里存的是 UTC，直接截字符串会差出一个时区，必须按本地时间显示
+  function localStamp(value) {
+    var d = new Date(value);
+    if (isNaN(d.getTime())) return String(value || '');
+    var two = function (n) { return (n < 10 ? '0' : '') + n; };
+    return two(d.getMonth() + 1) + '-' + two(d.getDate()) + ' ' + two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds());
+  }
+
+  function renderEvents() {
+    var box = el('evList');
+    var list = state.autoCommits || [];
+    if (!list.length) { box.innerHTML = '<li class="empty" style="border:none;padding:10px 0">还没有自动提交记录</li>'; return; }
+    box.innerHTML = list.map(function (ev) {
+      when = localStamp(ev.time);
+      var name = String(ev.repo || '').split(/[\\/]/).pop();
+      var modeText = ev.mode === 'notify' ? '自动' : (ev.mode === 'silent' ? '静默' : '提醒');
+      var result;
+      if (ev.error) result = '<span class="bad">失败：' + esc(String(ev.error).slice(0, 48)) + '</span>';
+      else if (ev.skipped) result = '<span class="bad">' + esc(ev.note || '已跳过') + '</span>';
+      else result = '<span class="good">已提交 ' + esc(String(ev.commit || '').slice(0, 7)) + '</span><span class="m"> · ' + (ev.count || 0) + ' 个文件</span>';
+      return '<li><span class="t">' + esc(when) + '</span><span class="r">' + esc(name) + '</span><span class="m">' + modeText + '</span>' + result + '</li>';
+    }).join('');
+  }
+
+  async function loadBranches() {
+    try {
+      var d = await api('/api/branches');
+      var map = {};
+      (d.items || []).forEach(function (it) { map[keyp(it.path)] = { current: it.current, branches: it.branches }; });
+      state.branches = map;
+      if (!state.dirty) renderProjects();
+    } catch (e) {}
+  }
+
+  async function loadLog() {
+    try {
+      var d = await api('/api/log?lines=200');
+      el('log').textContent = d.text && d.text.trim() ? d.text : '（暂无日志）';
+    } catch (e) { el('log').textContent = '读取失败：' + e.message; }
+  }
+
+  el('tabs').addEventListener('click', function (e) {
+    var tab = e.target.getAttribute && e.target.getAttribute('data-tab');
+    if (!tab) return;
+    Array.prototype.forEach.call(document.querySelectorAll('#tabs button'), function (b) {
+      b.className = b.getAttribute('data-tab') === tab ? 'active' : '';
+    });
+    Array.prototype.forEach.call(document.querySelectorAll('.pane'), function (p) {
+      p.hidden = p.getAttribute('data-pane') !== tab;
+    });
+    if (tab === 'log') loadLog();
+  });
+
+  el('save').addEventListener('click', async function () {
+    setMsg('保存中…', '');
+    try {
+      var r = await api('/api/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config: readForm() })
+      });
+      state.dirty = false;
+      fillForm(r.config);
+      state.projects = (r.config.projects || []).map(function (p) { return Object.assign({}, p); });
+      renderProjects();
+      setMsg(r.restarted ? '已保存，监视已按新配置重启' : '已保存', 'ok');
+      loadBranches();
+      if (state.embedded && state.projects.length && !(state.monitor && state.monitor.running)) {
+        try {
+          var started = await api('/api/monitor', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'start' })
+          });
+          state.monitor = started.monitor;
+          renderMonitor();
+        } catch (e) {}
+      }
+      loadAll();
+    } catch (e) { setMsg(e.message, 'err'); }
+  });
+
+  el('cancel').addEventListener('click', async function () {
+    state.dirty = false;
+    setMsg('');
+    await loadAll();
+    setMsg('已还原', '');
+  });
+
+  el('toggleMonitor').addEventListener('click', async function () {
+    var running = state.monitor && state.monitor.running;
+    setMsg(running ? '停止中…' : '启动中…', '');
+    try {
+      var d = await api('/api/monitor', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: running ? 'stop' : 'start' })
+      });
+      state.monitor = d.monitor;
+      renderMonitor();
+      setMsg(running ? '已停止' : '已启动', 'ok');
+      setTimeout(loadLog, 600);
+    } catch (e) { setMsg(e.message, 'err'); }
+  });
+
+  el('addOpen').addEventListener('click', function () {
+    el('overlay').hidden = false;
+    el('dlgPath').value = '';
+    setDlgMsg('', '');
+    // 每次打开都从「选文件夹」重新开始，避免上次的勾选串到这次
+    state.pickedRoot = '';
+    state.discovered = [];
+    state.scanned = false;
+    state.selected = {};
+    renderFound();
+  });
+  el('dlgClose').addEventListener('click', function () { el('overlay').hidden = true; });
+  el('overlay').addEventListener('click', function (e) { if (e.target === el('overlay')) el('overlay').hidden = true; });
+
+  function setDlgMsg(text, kind) {
+    var n = el('dlgMsg');
+    n.textContent = text || '';
+    n.style.color = kind === 'err' ? 'var(--danger)' : (kind === 'ok' ? 'var(--ok)' : '');
+  }
+
+  async function addProject(rawPath) {
+    var target = String(rawPath || '').trim().replace(/\\/g, '/');
+    if (!target) return;
+    if (state.projects.some(function (p) { return keyp(p.path) === keyp(target); })) {
+      setDlgMsg('这个项目已经在列表里了', 'err');
+      return;
+    }
+    setDlgMsg('检查中…', '');
+    try {
+      var info = await api('/api/check?path=' + encodeURIComponent(target));
+      if (!info.ok) { setDlgMsg(info.problem, 'err'); return; }
+      state.branches[keyp(info.path)] = { current: info.current, branches: info.branches };
+      state.projects.push({ path: info.path, enabled: true, branch: '', idleSeconds: 0, message: '', mode: 'remind' });
+      state.dirty = true;
+      renderProjects();
+      renderFound();
+      setDlgMsg(info.identityOk ? '已加入，记得点保存' : '已加入，但这个仓库还没配置 git 用户名和邮箱，提交会失败', info.identityOk ? 'ok' : 'err');
+    } catch (e) { setDlgMsg(e.message, 'err'); }
+  }
+
+  async function scanInto(root) {
+    el('dlgList').innerHTML = '<div class="empty">扫描中…这个文件夹大的话要等一会儿</div>';
+    el('dlgListHead').hidden = true;
+    try {
+      var r = await api('/api/repos?root=' + encodeURIComponent(root));
+      state.pickedRoot = r.root || root;
+      state.discovered = r.discovered || [];
+      state.scanned = true;
+      state.selected = {};
+      state.discovered.forEach(function (x) {
+        if (!state.projects.some(function (p) { return keyp(p.path) === keyp(x.repo); })) state.selected[keyp(x.repo)] = true;
+      });
+      setDlgMsg(r.errors && r.errors.length ? ('扫描时有 ' + r.errors.length + ' 处读不了，已跳过') : '', '');
+      renderFound();
+    } catch (e) { el('dlgList').innerHTML = '<div class="empty">扫描失败</div>'; setDlgMsg(e.message, 'err'); }
+  }
+
+  el('dlgPick').addEventListener('click', async function () {
+    try {
+      var picked = await api('/api/pick-folder', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      if (picked.supported === false) { setDlgMsg('当前环境弹不出选择框，请在下面手动填路径', 'err'); return; }
+      if (picked.canceled || !picked.path) return;
+      setDlgMsg('', '');
+      await scanInto(picked.path);
+    } catch (e) { setDlgMsg(e.message, 'err'); }
+  });
+
+  el('dlgAll').addEventListener('click', function () {
+    var pending = pendingRepos();
+    var allOn = pending.every(function (r) { return state.selected[keyp(r.repo)]; });
+    pending.forEach(function (r) { state.selected[keyp(r.repo)] = !allOn; });
+    renderFound();
+  });
+
+  el('dlgList').addEventListener('change', function (e) {
+    var v = e.target.getAttribute && e.target.getAttribute('data-sel');
+    if (v === null || v === undefined) return;
+    state.selected[keyp(v)] = !!e.target.checked;
+    updateAddSel();
+  });
+
+  el('dlgAddSel').addEventListener('click', function () {
+    var picked = pendingRepos().filter(function (r) { return state.selected[keyp(r.repo)]; });
+    if (!picked.length) return;
+    picked.forEach(function (r) {
+      if (!state.branches[keyp(r.repo)]) state.branches[keyp(r.repo)] = { current: r.branch || '', branches: r.branch ? [r.branch] : [] };
+      state.projects.push({ path: r.repo.replace(/\\/g, '/'), enabled: true, branch: '', idleSeconds: 0, message: '', mode: 'remind' });
+    });
+    state.dirty = true;
+    renderProjects();
+    renderFound();
+    loadBranches();
+    setDlgMsg('已加入 ' + picked.length + ' 个，记得点保存', 'ok');
+  });
+
+  el('dlgAddPath').addEventListener('click', function () {
+    addProject(el('dlgPath').value);
+    el('dlgPath').value = '';
+  });
+  el('dlgPath').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { addProject(el('dlgPath').value); el('dlgPath').value = ''; }
+  });
+  el('dlgScan').addEventListener('click', async function () {
+    if (!state.pickedRoot) { setDlgMsg('先点「选择文件夹」', 'err'); return; }
+    await scanInto(state.pickedRoot);
+  });
+
+  function onProjEdit(e) {
+    var row = e.target.closest ? e.target.closest('.proj') : null;
+    if (!row) return;
+    var i = Number(row.getAttribute('data-i')), f = e.target.getAttribute('data-f');
+    if (!(i >= 0) || i >= state.projects.length || !f) return;
+    if (f === 'enabled') state.projects[i].enabled = !!e.target.checked;
+    else if (f === 'branch') state.projects[i].branch = e.target.value.trim();
+    state.dirty = true;
+  }
+
+  el('projList').addEventListener('input', onProjEdit);
+  el('projList').addEventListener('change', onProjEdit);
+
+  el('projList').addEventListener('click', function (e) {
+    var gate = e.target.getAttribute && e.target.getAttribute('data-gate');
+    if (gate !== null && gate !== undefined) { fixGate(Number(gate)); return; }
+    var raw = e.target.getAttribute && e.target.getAttribute('data-del');
+    if (raw === null) return;
+    state.projects.splice(Number(raw), 1);
+    state.dirty = true;
+    renderProjects();
+    renderFound();
+  });
+
+  el('logBtn').addEventListener('click', loadLog);
+
+  ['mode', 'idleMinutes'].forEach(function (id) {
+    el(id).addEventListener('input', function () { state.dirty = true; });
+  });
+
+  // 自启动是系统动作，勾了立刻生效，不跟「保存」走——否则用户会以为勾上就设好了
+  el('autoStart').addEventListener('change', async function (e) {
+    var box = e.target, want = box.checked;
+    box.disabled = true;
+    try {
+      var r = await api('/api/autostart', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: want })
+      });
+      if (r.supported === false) throw new Error(r.note || '这个环境不支持');
+      if (r.error) throw new Error(r.error);
+      if (r.openAtLogin !== undefined) box.checked = !!r.openAtLogin;
+      el('autoStartNote').textContent = '';
+      el('autoStartNote').hidden = true;
+      setMsg(box.checked ? '已开启开机自启动' : '已关闭开机自启动', 'ok');
+    } catch (err) {
+      box.checked = !want;
+      el('autoStartNote').textContent = '设置失败：' + err.message;
+      el('autoStartNote').hidden = false;
+      setMsg('设置失败：' + err.message, 'err');
+    } finally {
+      box.disabled = !state.autoStartSupported;
+    }
+  });
+
+  // ---- 环境自查：缺什么就挡住，并给下载按钮 ----
+  var prereqState = { blocked: false, report: null, jobs: {} };
+
+  function fmtSize(bytes) {
+    if (!bytes) return '';
+    if (bytes > 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+    return Math.round(bytes / 1024) + ' KB';
+  }
+
+  function blockerItem(item) {
+    var li = document.createElement('li');
+    li.className = 'bitem';
+    var mark = document.createElement('span');
+    mark.className = 'bmark' + (item.ok ? ' ok' : '');
+    mark.textContent = item.ok ? '✔' : '!';
+    li.appendChild(mark);
+    var main = document.createElement('div');
+    main.className = 'bmain';
+    var name = document.createElement('div');
+    name.className = 'bname';
+    name.textContent = item.title;
+    main.appendChild(name);
+    var detail = document.createElement('div');
+    detail.className = 'bdetail';
+    detail.textContent = item.detail || '';
+    main.appendChild(detail);
+    if (!item.ok && item.fix === 'download') {
+      var acts = document.createElement('div');
+      acts.className = 'bacts';
+      var btn = document.createElement('button');
+      btn.className = 'small';
+      btn.textContent = '下载安装包';
+      btn.addEventListener('click', function () { startPrereqDownload(item, btn, acts); });
+      acts.appendChild(btn);
+      var prog = document.createElement('span');
+      prog.className = 'bprog';
+      prog.id = 'prog-' + item.id;
+      acts.appendChild(prog);
+      main.appendChild(acts);
+    }
+    if (!item.ok && item.fix === 'config' && item.commands) {
+      var box = document.createElement('div');
+      box.className = 'bcmd';
+      box.textContent = item.commands.join('\n');
+      main.appendChild(box);
+      var acts2 = document.createElement('div');
+      acts2.className = 'bacts';
+      var copy = document.createElement('button');
+      copy.className = 'small ghost';
+      copy.textContent = '复制命令';
+      copy.addEventListener('click', function () {
+        navigator.clipboard.writeText(item.commands.join('\n')).then(function () {
+          copy.textContent = '已复制';
+          setTimeout(function () { copy.textContent = '复制命令'; }, 1600);
+        });
+      });
+      acts2.appendChild(copy);
+      main.appendChild(acts2);
+    }
+    li.appendChild(main);
+    return li;
+  }
+
+  function renderBlocker(report) {
+    var list = el('blockerList');
+    list.textContent = '';
+    (report.items || []).forEach(function (item) { list.appendChild(blockerItem(item)); });
+    el('blocker').hidden = false;
+  }
+
+  function hideBlocker() { el('blocker').hidden = true; }
+
+  // 每 700 毫秒问一次进度；下载完给一个「打开所在文件夹」
+  function watchDownload(id, item, btn, acts) {
+    var prog = el('prog-' + item.id);
+    async function step() {
+      var job = null;
+      try { job = await api('/api/prereq/download?id=' + encodeURIComponent(id)); } catch (e) {
+        if (prog) { prog.className = 'bprog err'; prog.textContent = '查询进度失败：' + e.message; }
+        btn.disabled = false;
+        return;
+      }
+      if (job.state === 'done') {
+        if (prog) { prog.className = 'bprog ok'; prog.textContent = '已下载：' + job.file; }
+        btn.hidden = true;
+        var open = document.createElement('button');
+        open.className = 'small ghost';
+        open.textContent = '打开所在文件夹';
+        open.addEventListener('click', function () {
+          api('/api/prereq/reveal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: job.file }) })
+            .then(function () { setMsg('已打开下载文件夹，双击安装包即可安装', 'ok'); })
+            .catch(function (e) { setMsg('打不开文件夹：' + e.message, 'err'); });
+        });
+        acts.appendChild(open);
+        setMsg('安装包已下载，装完点「重新检测」', 'ok');
+        return;
+      }
+      if (job.state === 'error') {
+        if (prog) { prog.className = 'bprog err'; prog.textContent = job.error || '下载失败'; }
+        btn.disabled = false;
+        return;
+      }
+      if (prog) {
+        prog.className = 'bprog';
+        var pct = job.total ? Math.floor(job.received * 100 / job.total) : null;
+        prog.textContent = job.state === 'resolving' ? '正在找安装包…'
+          : ('下载中 ' + (pct === null ? fmtSize(job.received) : (pct + '%（' + fmtSize(job.received) + ' / ' + fmtSize(job.total) + '）')));
+      }
+      setTimeout(step, 700);
+    }
+    step();
+  }
+
+  async function startPrereqDownload(item, btn, acts) {
+    btn.disabled = true;
+    var prog = el('prog-' + item.id);
+    if (prog) { prog.className = 'bprog'; prog.textContent = '正在准备…'; }
+    try {
+      var r = await api('/api/prereq/download', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ what: item.id })
+      });
+      watchDownload(r.id, item, btn, acts);
+    } catch (e) {
+      if (prog) { prog.className = 'bprog err'; prog.textContent = e.message; }
+      btn.disabled = false;
+    }
+  }
+
+  async function checkPrereq(silent) {
+    var report = null;
+    try { report = await api('/api/prereq'); } catch (e) { return; }
+    prereqState.report = report;
+    prereqState.blocked = !report.ok;
+    if (report.ok) { hideBlocker(); return true; }
+    renderBlocker(report);
+    if (!silent) setMsg('还差 ' + report.missing.length + ' 项才能用', 'err');
+    return false;
+  }
+
+  el('recheck').addEventListener('click', async function () {
+    var ok = await checkPrereq(true);
+    if (!ok) { setMsg('还没配齐，按上面的提示补齐再试', 'err'); return; }
+    // 配齐了就顺手把监视拉起来，省得用户再点一次
+    try {
+      await api('/api/monitor', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'start' }) });
+      setMsg('环境已就绪，监视已启动', 'ok');
+    } catch (e) { setMsg('环境已就绪：' + e.message, 'ok'); }
+    loadAll();
+  });
+  checkPrereq().then(function (ok) { if (ok) loadAll().then(function () { loadBranches(); }); });
+  // 项目多时单次刷新可能要好几秒，固定 5 秒轮询会排成一串，这里按上次耗时自适应拉开间隔。
+  (function tick() {
+    var wait = 5000;
+    (async function () {
+      if (!state.dirty) {
+        var started = Date.now();
+        try { await loadAll(); } catch (e) {}
+        var spent = Date.now() - started;
+        if (spent > 1500) wait = Math.min(Math.max(spent * 2, 5000), 30000);
+      }
+      setTimeout(tick, wait);
+    })();
+  })();
+</script>
+</body>
+</html>
