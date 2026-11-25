@@ -37,7 +37,7 @@ fs.mkdirSync(path.dirname(out), { recursive: true });
 
 const args = [
   '/nologo', '/target:winexe', '/optimize+', '/platform:anycpu',
-  '/out:' + out,
+  '/out:' + path.join(work, 'setup.exe'),
   '/resource:' + resource + ',payload.zip',
   '/reference:System.Windows.Forms.dll',
   '/reference:System.Drawing.dll',
@@ -52,7 +52,25 @@ if (r.status !== 0) {
   console.error(r.stderr || '');
   throw new Error('csc 编译失败，退出码 ' + r.status);
 }
+// 目标文件可能被杀软或上次运行的句柄占用：最多重试几次，仍不行就换个名字写出来
+const built = path.join(work, 'setup.exe');
+let finalPath = out;
+let moved = false;
+for (let i = 0; i < 6 && !moved; i++) {
+  try {
+    fs.rmSync(out, { force: true });
+    fs.renameSync(built, out);
+    moved = true;
+  } catch (e) {
+    await new Promise(function (r) { setTimeout(r, 1500); });
+  }
+}
+if (!moved) {
+  finalPath = out.replace(/\.exe$/i, '-new.exe');
+  fs.copyFileSync(built, finalPath);
+  console.warn('目标文件被占用，已写到：' + finalPath);
+}
 fs.rmSync(work, { recursive: true, force: true });
-const size = fs.statSync(out).size;
-console.log('安装器：' + out);
+const size = fs.statSync(finalPath).size;
+console.log('安装器：' + finalPath);
 console.log('大小：' + (size / 1048576).toFixed(1) + ' MB');
