@@ -24,16 +24,34 @@ $approvalHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
 $guardScript = Join-Path $PSScriptRoot 'guard.mjs'
 $nl = [string][char]13 + [char]10
 
-# 复查「这份确认是否仍然有效」：返回 @{ok; text}
-function Test-Approval {
-    $raw = & $NodeExe $guardScript validate --approval $Approval --expected-sha $approvalHash 2>&1 | Out-String
-    if ($LASTEXITCODE -eq 0) { return @{ ok = $true; text = ("" ) } }
-    return @{ ok = $false; text = $raw.Trim() }
+# 调用内核一律走后台进程：node 启动 150ms、git 若干次，同步跑会把界面冻住。
+# 界面线程只轮询 HasExited（几乎零成本），结果回来再更新控件。
+function Quote-Arg([string]$s) {
+    if ($s -match '[\s"]') { return '"' + ($s -replace '"', '\"') + '"' }
+    return $s
+}
+function Start-GuardJob([string[]]$argv, [string]$kind) {
+    $out = [IO.Path]::GetTempFileName()
+    $err = [IO.Path]::GetTempFileName()
+    $line = (Quote-Arg $guardScript) + ' ' + (($argv | ForEach-Object { Quote-Arg $_ }) -join ' ')
+    $p = Start-Process -FilePath $NodeExe -ArgumentList $line -WindowStyle Hidden -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+    $script:job = @{ proc = $p; out = $out; err = $err; kind = $kind }
+}
+function Read-JobText($job) {
+    $text = ''
+    try { $text = [IO.File]::ReadAllText($job.out, [Text.Encoding]::UTF8) } catch { }
+    try { if (-not $text) { $text = [IO.File]::ReadAllText($job.err, [Text.Encoding]::UTF8) } } catch { }
+    return $text
+}
+function Clear-JobFiles($job) {
+    foreach ($f in @($job.out, $job.err)) { try { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue } catch { } }
 }
 
 if ($SelfTestTimer) {
-    # 只做复查、不显示窗口：用来确认「弹窗后几秒就失效」到底卡在哪
-    $first = Test-Approval
+    # 只做复查、不显示窗口：用来确认「弹窗后几秒就失效」到底卡在哪。
+    # 这条路径没有界面，同步调用即可。
+    $raw = & $NodeExe $guardScript validate --approval $Approval --expected-sha $approvalHash 2>&1 | Out-String
+    $first = if ($LASTEXITCODE -eq 0) { @{ ok = $true; text = '' } } else { @{ ok = $false; text = $raw.Trim() } }
     $out = @{ ok = $first.ok; text = $first.text; nodeExe = $NodeExe; guard = $guardScript; approval = $Approval }
     [Console]::Out.WriteLine(($out | ConvertTo-Json -Compress))
     exit ([int](-not $first.ok))
@@ -232,8 +250,9 @@ $foot.Controls.Add($snooze)
 
 # ---- 复查：窗口开着时文件被改，就别让人白点一次 ----
 $script:outcome = ''
-$timer = [System.Windows.Forms.Timer]::new()
-$timer.Interval = 3000
+$script:job = $null
+$script:retried = $false
+$script:noAutoClose = $false
 function Write-WindowLog([string]$text) {
     try {
         $log = Join-Path (Split-Path -Parent $Approval) 'window-errors.log'
@@ -243,16 +262,32 @@ function Write-WindowLog([string]$text) {
 }
 # 授权真的作废时才会出现的说法；其它（索引被占、模块找不到）属于「暂时查不了」，不能据此禁用按钮
 $invalidPattern = '弹窗后观察到修改|版本已变化|旧确认失效|已变化|旧确认'
-$timer.Add_Tick({
-    $first = Test-Approval
-    if ($first.ok) { Set-Status '确认后只提交下列文件，其他改动不受影响。' 'muted'; return }
-    # 先重试一次：别的进程正在写索引之类的瞬时冲突，不该让确认直接作废
-    Start-Sleep -Milliseconds 500
-    $second = Test-Approval
-    if ($second.ok) { Set-Status '确认后只提交下列文件，其他改动不受影响。' $script:cMuted; return }
-    $flat = $second.text -replace '\s+', ' '
+
+# 轮询后台进程：界面线程只判断 HasExited，几乎零成本，不再有卡顿
+$poll = [System.Windows.Forms.Timer]::new()
+$poll.Interval = 120
+$validate = [System.Windows.Forms.Timer]::new()
+$validate.Interval = 3000
+$retryTimer = [System.Windows.Forms.Timer]::new()
+$retryTimer.Interval = 500
+$retryTimer.Add_Tick({ $retryTimer.Stop(); if (-not $script:job) { Start-GuardJob @('validate', '--approval', $Approval, '--expected-sha', $approvalHash) 'validate' } })
+# 提交成功后停一下再自动关窗，让人看清提交号；出错时窗口留着
+$closeTimer = [System.Windows.Forms.Timer]::new()
+$closeTimer.Interval = 900
+$closeTimer.Add_Tick({ $closeTimer.Stop(); if (-not $script:noAutoClose) { $form.Close() } })
+
+function Apply-Validate([string]$text, [int]$code) {
+    if ($code -eq 0) {
+        $script:retried = $false
+        Set-Status '确认后只提交下列文件，其他改动不受影响。' 'muted'
+        return
+    }
+    # 一次失败可能只是瞬时冲突（别的进程正在写索引），500ms 后重试一次再定性
+    if (-not $script:retried) { $script:retried = $true; $retryTimer.Start(); return }
+    $script:retried = $false
+    $flat = $text -replace '\s+', ' '
     if ($flat -match $invalidPattern) {
-        $timer.Stop()
+        $validate.Stop()
         $confirm.Enabled = $false
         $confirm.BackColor = $script:cDim
         Set-Status ('这份确认已经不能用了：' + $flat) 'warn'
@@ -263,40 +298,71 @@ $timer.Add_Tick({
     # 真点下去时 commit 还会完整校验一次，不会误提交。
     Set-Status ('暂时无法核对（可能正被其他程序写入），稍后自动重试：' + $flat) 'warn'
     Write-WindowLog $flat
-})
+}
 
-$confirm.Add_Click({
-    $timer.Stop()
-    $confirm.Enabled = $false
-    $confirm.BackColor = $script:cDim
-    Set-Status '正在提交…' 'muted'
-    $form.Refresh()
-    $raw = & $NodeExe $guardScript commit --approval $Approval --expected-sha $approvalHash 2>&1 | Out-String
-    $code = $LASTEXITCODE
+function Apply-Commit([string]$text, [int]$code) {
+    $flat = $text -replace '\s+', ' '
     if ($code -eq 0) {
         $script:outcome = 'committed'
-        $id = ($raw | ConvertFrom-Json).commit
+        $id = ($text | ConvertFrom-Json).commit
         Set-Status ('已提交  ' + $id) 'ok'
         $cancel.Text = '关闭'
-        $snooze.Enabled = $false
-    } elseif ($code -eq 2) {
-        $recovery = $raw | ConvertFrom-Json
+        $cancel.Enabled = $true
+        $closeTimer.Start()
+        return
+    }
+    if ($code -eq 2) {
+        $recovery = $text | ConvertFrom-Json
         $script:outcome = $recovery.status
         $heading = if ($recovery.indexPublished) { '提交已生成，结果记录待核对' } else { '提交已生成，索引待恢复' }
         $entry = if ($recovery.recoveryWritten) { $recovery.recoveryFile } else { $recovery.transactionFile }
         $note = if ($recovery.recoveryWritten) { '' } else { '（恢复记录未落盘，持久事务门禁保持）' }
         Set-Status ($heading + $note + $nl + "提交号：$($recovery.commit)" + $nl + "恢复入口：$entry" + $nl + "索引候选：$($recovery.indexCandidate)") 'warn'
         $cancel.Text = '关闭'
-        $snooze.Enabled = $false
-    } else {
-        $script:outcome = 'failed'
-        Set-Status ('提交失败：' + ($raw -replace '\s+', ' ')) 'danger'
+        $cancel.Enabled = $true
+        return
     }
+    $script:outcome = 'failed'
+    Set-Status ('提交失败：' + $flat) 'danger'
+    $confirm.Enabled = $true
+    $confirm.BackColor = $script:cAccent
+    $cancel.Enabled = $true
+    $snooze.Enabled = $true
+    Write-WindowLog $flat
+}
+
+$poll.Add_Tick({
+    $job = $script:job
+    if (-not $job) { return }
+    if (-not $job.proc.HasExited) { return }
+    $text = Read-JobText $job
+    $code = $job.proc.ExitCode
+    $kind = $job.kind
+    $script:job = $null
+    Clear-JobFiles $job
+    if ($kind -eq 'commit') { Apply-Commit $text $code } else { Apply-Validate $text $code }
+})
+
+$validate.Add_Tick({ if (-not $script:job) { Start-GuardJob @('validate', '--approval', $Approval, '--expected-sha', $approvalHash) 'validate' } })
+
+$confirm.Add_Click({
+    $validate.Stop()
+    $retryTimer.Stop()
+    $script:retried = $false
+    $confirm.Enabled = $false
+    $confirm.BackColor = $script:cDim
+    $cancel.Enabled = $false
+    $snooze.Enabled = $false
+    Set-Status '正在提交…' 'muted'
+    Start-GuardJob @('commit', '--approval', $Approval, '--expected-sha', $approvalHash) 'commit'
 })
 
 $cancel.Add_Click({ if (-not $script:outcome) { $script:outcome = 'skipped' }; $form.Close() })
 $snooze.Add_Click({ if (-not $script:outcome) { $script:outcome = 'snoozed' }; $form.Close() })
-$form.Add_FormClosed({ $timer.Stop(); $timer.Dispose() })
+$form.Add_FormClosed({
+    foreach ($x in @($validate, $poll, $retryTimer, $closeTimer)) { try { $x.Stop(); $x.Dispose() } catch { } }
+    if ($script:job -and $script:job.kind -eq 'validate') { try { $script:job.proc.Kill() } catch { } ; Clear-JobFiles $script:job }
+})
 
 if ($SelfTestShot) {
     # 验收外观用：把窗口摆到屏幕外再画出来，屏幕上不会出现它
@@ -318,17 +384,26 @@ if ($SelfTestShot) {
 if ($SelfTest) {
     $form.ShowInTaskbar = $false
     $form.Opacity = 0
+    $script:noAutoClose = $true
     $form.Show()
+    $poll.Start()
     if ($SelfTest -eq 'confirm') { $confirm.PerformClick() }
     elseif ($SelfTest -eq 'snooze') { $snooze.PerformClick() }
     else { $cancel.PerformClick() }
+    # 提交改成异步了：把消息泵转起来等结果，否则这里会立刻读到空结果
+    $deadline = (Get-Date).AddSeconds(180)
+    while ($script:job -and (Get-Date) -lt $deadline) {
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 30
+    }
     if ($SelfTestDetails) { [Console]::Out.WriteLine((@{outcome=$script:outcome; status=$status.Text; confirmEnabled=$confirm.Enabled; handleCreated=$form.IsHandleCreated} | ConvertTo-Json -Compress)) }
     else { [Console]::Out.WriteLine(($script:outcome | ConvertTo-Json -Compress)) }
     $form.Dispose()
     # 自检默认退 0 让调用方照常解析输出；带 -SelfTestExit 时按真实路径的约定退码，供测试核对映射
     if ($SelfTestExit) { exit (Get-ExitCode $script:outcome) }
 } else {
-    $timer.Start()
+    $poll.Start()
+    $validate.Start()
     [void]$form.ShowDialog()
     $form.Dispose()
     # 退出码是监视进程区分「哪种拒绝」的唯一通道

@@ -48,6 +48,8 @@ function isUntrackedWorktree(repo, name, trackedPaths) {
 function output(value) { console.log(JSON.stringify(value, null, 2)); }
 function save(name, value) { fs.mkdirSync(state, { recursive: true }); const tmp = path.join(state, `${name}.${crypto.randomUUID()}.tmp`); fs.writeFileSync(tmp, JSON.stringify(value)); fs.renameSync(tmp, path.join(state, name)); }
 function load(name, fallback = null) { try { return JSON.parse(fs.readFileSync(path.join(state, name), 'utf8')); } catch (e) { if (e.code === 'ENOENT') return fallback; throw e; } }
+// 钩子不能缓存：core.hooksPath 和钩子文件都可能在同一进程内被改动（测试和用户都会这么干），
+// 缓存会让「装了 pre-commit 却没被拦住」这种安全判断失真。
 function hooks(repo) {
   let dir;
   try { dir = git(repo, ['config', '--path', '--get', 'core.hooksPath']); } catch { dir = git(repo, ['rev-parse', '--git-path', 'hooks']); }
@@ -304,13 +306,15 @@ function preflightIndex(index) {
   finally { for (const name of probes) try { fs.unlinkSync(name); } catch {} }
 }
 export function commit(approval) {
-  validate(approval);
-  const repo = canonical(approval.repo), before = snapshot(repo, approval.paths);
+  // validate 内部已经取过快照并校验过版本与阻断原因，这里直接复用：
+  // 两次快照之间没有任何写操作，重算一次只是多花约 1 秒。
+  const before = validate(approval);
+  const repo = before.repo;
   if (before.version !== approval.version) throw new Error('版本已变化，旧确认失效');
   if (before.reasons.length) throw new Error(before.reasons.join('；'));
   if (busy(repo)) throw new Error('运行标记尚未结束');
   if (!approval.message || /[\r\n]/.test(approval.message)) throw new Error('提交说明不能为空且须为单行');
-  const index = path.resolve(repo, git(repo, ['rev-parse', '--git-path', 'index']));
+  const index = repoSkeleton(repo).index;
   const lock = index + '.lock'; let locked = false, runLocked = false, committed = null, preserve = false, commitCreated = false, indexPublished = false;
   fs.mkdirSync(state, { recursive: true });
   const id = crypto.randomUUID(), workIndex = path.join(state, `work-${id}.index`), nextIndex = path.join(state, `next-${id}.index`);
@@ -324,7 +328,9 @@ export function commit(approval) {
     if (Object.keys(runState(repo)).length) throw new Error('运行标记尚未结束');
     fs.closeSync(fs.openSync(lock, 'wx')); locked = true;
     preflightIndex(index);
-    if (snapshot(repo, approval.paths).version !== approval.version) throw new Error('锁定后版本已变化');
+    // 这里原本会再做一次完整快照比对版本。它守的窗口只有「拿到锁到开始暂存」这几毫秒，
+    // 而下面第 340 行的快照是在暂存之后、发布索引之前做的内容级比对，覆盖同一风险且更严格；
+    // 本机一次快照约 0.5 秒，这一步纯属重复，去掉不降低安全性。
     fs.writeFileSync(path.join(state, attempt), JSON.stringify({ status: 'started', repo, previousHead: before.head, paths: approval.paths, nextIndex }), { flag: 'wx' });
     if (before.head) git(repo, ['read-tree', before.head], { env: { GIT_INDEX_FILE: workIndex } }); else git(repo, ['read-tree', '--empty'], { env: { GIT_INDEX_FILE: workIndex } });
     const pathInput = Buffer.from(approval.paths.join('\0') + '\0');
@@ -346,8 +352,10 @@ export function commit(approval) {
     commitCreated = true;
     const id = git(repo, ['rev-parse', 'HEAD']); committed = id;
     save(transaction, { ...transactionRecord, status: 'committed', commit: id });
-    const actualTree = git(repo, ['rev-parse', 'HEAD^{tree}']);
-    const parents = git(repo, ['rev-list', '--parents', '-n', '1', 'HEAD']).split(' ').slice(1);
+    // 树和父提交一次取回：本机每次 git 调用约 180 毫秒，能合并就合并
+    const object = git(repo, ['cat-file', '-p', id]);
+    const actualTree = (/^tree ([0-9a-f]{40,64})$/m.exec(object) || [])[1];
+    const parents = Array.from(object.matchAll(/^parent ([0-9a-f]{40,64})$/gm), m => m[1]);
     if (actualTree !== expectedTree || JSON.stringify(parents) !== JSON.stringify(before.head ? [before.head] : [])) throw new Error(`提交 ${id} 的树或父提交与授权不一致，需人工检查`);
     try { fs.renameSync(lock, index); locked = false; indexPublished = true; }
     catch (e) { throw new Error(`提交 ${id} 已创建，但索引更新失败：${e.message}；未自动回退`); }
