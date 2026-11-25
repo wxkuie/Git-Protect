@@ -1,4 +1,4 @@
-# 安装 Git 静默提交助手（当前用户，不需要管理员）
+﻿# 安装 Git 静默提交助手（当前用户，不需要管理员）
 param(
   [string]$Target = (Join-Path $env:LOCALAPPDATA 'Programs\GitQuietHelper'),
   [switch]$NoLaunch,

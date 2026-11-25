@@ -48,11 +48,16 @@
 
 ## 安装
 
-到 [Releases](../../releases) 下载 `GitQuietHelper-<版本>-win64.zip`，解压后双击 `安装.cmd`。
+到 [Releases](../../releases) 下载 **`GitQuietHelper-<版本>-setup.exe`**，双击，等进度条走完就行——装完自动启动，不需要解压、不需要管理员权限。
+
+（Release 里的 `Source code.zip` 是 GitHub 自动生成的仓库快照，不是安装包，别下那个。）
+
+也可以下载 `GitQuietHelper-<版本>-win64.zip` 手动装：解压后双击 `安装.cmd`。两种方式装出来的东西完全一样，zip 那份适合想先看看文件构成、或要放到内网分发的人。
 
 - 装到 `%LOCALAPPDATA%\Programs\GitQuietHelper`，**不需要管理员权限**
 - 建开始菜单和桌面快捷方式，在「应用和功能」里登记卸载项
 - 卸载走 `卸载.cmd` 或系统设置，会问要不要一并删掉配置和提交记录
+- 安装脚本优先用 PowerShell 7，没有就退回系统自带的 5.1，所以**没装 pwsh 也能装完**，装完程序会提示你补
 
 没有签名的 exe，第一次运行 Windows SmartScreen 会拦一下：点「更多信息」→「仍要运行」。想彻底不提示只能买代码签名证书，这个项目没有买。
 
@@ -121,6 +126,7 @@ npm run panel        # 或者只在浏览器里开配置面板 http://127.0.0.1:
 $env:ELECTRON_MIRROR='https://npmmirror.com/mirrors/electron/'
 npm run package      # dist/GitQuietHelper-win32-x64/
 npm run installer    # dist/GitQuietHelper-<版本>-win64.zip
+npm run setup        # dist/GitQuietHelper-<版本>-setup.exe（单文件安装器）
 ```
 
 ## 许可

@@ -1,4 +1,4 @@
-# 卸载 Git 静默提交助手（当前用户）
+﻿# 卸载 Git 静默提交助手（当前用户）
 param([switch]$KeepConfig, [switch]$Silent)
 $ErrorActionPreference = 'Continue'
 

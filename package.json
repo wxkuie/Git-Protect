@@ -24,7 +24,8 @@
     "app": "electron .",
     "package": "node scripts/package.mjs",
     "installer": "node scripts/pack-installer.mjs",
-    "icon": "electron scripts/make-icon.mjs"
+    "icon": "electron scripts/make-icon.mjs",
+    "setup": "node scripts/make-setup.mjs"
   },
   "devDependencies": {
     "@electron/packager": "^20.3.0",
