@@ -306,6 +306,13 @@ test('GitHub 连不上时退国内镜像，按目录列表挑最新版本', () =
   assert.equal(pickMirrorGitTag([{ name: 'v1.0.0/' }]), null, '不完整的版本号不算');
 });
 
+
+test('包名必须固定：它决定用户配置目录，改名会让老配置看起来丢了', () => {
+  const pkg = JSON.parse(fs.readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
+  assert.equal(pkg.name, 'git-quiet-helper',
+    'Electron 用 package.json 的 name 推导 %APPDATA% 目录；改名等于换一个空配置目录，用户会以为设置被删了');
+});
+
 test('默认 hook 存在时隐藏窗口确认按钮阻断', () => {
   const r = fixture(); write(r, 'a.txt', 'hook'); const hook = path.join(r, '.git', 'hooks', 'pre-commit'); fs.writeFileSync(hook, '#!/bin/sh\necho bad > hook-ran\n', { mode: 0o755 }); const a = approve(r); assert.match(a.reasons.join(), /hook/);
   const f = path.join(base, 'blocked.json'); fs.writeFileSync(f, JSON.stringify(a)); const old = git(r, 'rev-parse', 'HEAD');
