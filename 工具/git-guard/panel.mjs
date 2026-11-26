@@ -7,7 +7,7 @@ import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
-import { scan, recoveryReport, clearRecovery } from './guard.mjs';
+import { scan, recoveryReport, clearRecovery, useStateDir } from './guard.mjs';
 // 状态行与分支列表在工作线程里算：同步 git 会卡住整个 HTTP 服务（实测单次重算 5 秒）
 import { projectRows, branchList as branchListSync, currentBranchOf } from './panel-facts.mjs';
 import { inspectPrereqs, pickGitAsset, pickPowerShellMsi, pickMirrorGitTag, mirrorGitAsset, downloadDir, GIT_RELEASES_API, PS_RELEASES_API, GIT_MIRROR_LISTING } from './prereq.mjs';
@@ -18,7 +18,9 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const uiPath = path.join(here, 'panel', 'ui.html');
 // 打包后安装目录可能只读，配置与状态必须能落到用户目录；默认仍是仓库内（已忽略入库）。
 let configPath = path.join(here, 'config.json');
-let stateDir = path.join(here, '.state');
+// 与 guard.mjs 的默认值保持一致：环境里显式给了状态目录就跟着走，
+// 否则独立跑浏览器面板时两边会各读各的 .state。
+let stateDir = path.resolve(process.env.GIT_GUARD_STATE || path.join(here, '.state'));
 let logPath = path.join(stateDir, 'panel-monitor.log');
 
 // 配置面只留三样全局项（模式、停手时长、提交说明）加项目列表：
@@ -261,7 +263,8 @@ function facts(kind, config) {
     }
     const id = ++factsSeq;
     factsPending.set(id, { resolve: resolve, reject: reject });
-    try { worker.postMessage({ id: id, kind: kind, config: config }); }
+    // 状态线程是独立模块实例：把当前状态目录随任务带上，避免线程里还停在旧目录。
+    try { worker.postMessage({ id: id, kind: kind, config: config, stateDir: stateDir }); }
     catch (e) { factsPending.delete(id); reject(e); }
   });
 }
@@ -390,6 +393,24 @@ function readBody(req) {
 const server = http.createServer(async function (req, res) {
   const url = new URL(req.url, 'http://127.0.0.1');
   try {
+    // 面板只服务本机：校验 Host 防 DNS rebinding；校验 Origin 与 JSON Content-Type
+    // 防任意网页用不触发预检的简单请求改配置、启动/停止监视。缺一个都等于把写接口敞开。
+    const address = server.address();
+    const boundPort = address && typeof address !== 'string' ? address.port : 0;
+    const host = String(req.headers.host || '').toLowerCase();
+    if (!boundPort || (host !== '127.0.0.1:' + boundPort && host !== 'localhost:' + boundPort)) {
+      send(res, 403, { error: '只接受本机面板地址的请求' });
+      return;
+    }
+    const origin = String(req.headers.origin || '').toLowerCase();
+    if (origin && origin !== 'http://127.0.0.1:' + boundPort && origin !== 'http://localhost:' + boundPort) {
+      send(res, 403, { error: '拒绝跨源请求' });
+      return;
+    }
+    if (req.method === 'POST') {
+      const type = String(req.headers['content-type'] || '').toLowerCase();
+      if (type.indexOf('application/json') !== 0) { send(res, 415, { error: 'Content-Type 必须是 application/json' }); return; }
+    }
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
       send(res, 200, fs.readFileSync(uiPath, 'utf8'), 'text/html; charset=utf-8');
       return;
@@ -652,6 +673,9 @@ export async function startPanel(options) {
     stateDir = path.join(dataDir, 'state');
     logPath = path.join(stateDir, 'panel-monitor.log');
   }
+  // 面板自己调 guard 的那些函数（恢复诊断、状态行）必须和监视器用同一个状态目录，
+  // 否则打包版面板读的是安装目录 .state，监视器写的是 %APPDATA%，界面上看不到也清不掉门禁。
+  useStateDir(stateDir);
   const basePort = Number.isFinite(opts.port) ? opts.port : 7331;
   if (!Number.isFinite(basePort) || basePort < 0 || basePort > 65000) throw new Error('无效端口');
   let port = null;

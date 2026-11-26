@@ -5,7 +5,14 @@ import { spawnSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const home = path.dirname(fileURLToPath(import.meta.url));
-const state = path.resolve(process.env.GIT_GUARD_STATE || path.join(home, '.state'));
+// 状态目录必须可切换：打包版面板进程和它启动的监视器/状态线程要落在同一个目录
+// （%APPDATA%\git-quiet-helper\state）。原先这里是常量，面板一直读安装目录的 .state，
+// 监视器写的事务门禁在界面上既看不到也清不掉。
+let state = path.resolve(process.env.GIT_GUARD_STATE || path.join(home, '.state'));
+export function useStateDir(dir) {
+  if (dir) { state = path.resolve(dir); env.GIT_GUARD_STATE = state; }
+  return state;
+}
 const ignoreDirs = new Set(['.git', 'node_modules', 'vendor', 'dist', 'build', 'out', '.next', '.tmp', '.state', 'coverage', '.cache', 'backup', 'backups', '备份']);
 const env = { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', GIT_LITERAL_PATHSPECS: '1' };
 for (const name of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES']) delete env[name];
@@ -34,6 +41,35 @@ function selectedIndexRecords(repo, index, paths) {
     if (tab >= start && tab < end && wanted.has(bytes.subarray(tab + 1, end).toString('utf8'))) records.push(bytes.subarray(start, end + 1));
   }
   return Buffer.concat(records);
+}
+// 索引条目（mode + sha + stage）与某次提交里同一路径的条目对照，用来判断
+// 「索引还停在提交前的旧值」还是「失败之后用户自己重新暂存过」。恢复清理绝不能碰后者。
+function indexEntryMap(bytes) {
+  const map = new Map();
+  for (let start = 0, end; (end = bytes.indexOf(0, start)) >= 0; start = end + 1) {
+    const record = bytes.subarray(start, end).toString('utf8');
+    const tab = record.indexOf('\t');
+    if (tab < 0) continue;
+    const meta = record.slice(0, tab).split(' ');
+    if (meta.length < 3) continue;
+    map.set(record.slice(tab + 1), meta[0] + ' ' + meta[1] + ' ' + meta[2]);
+  }
+  return map;
+}
+function treeEntryMap(repo, commit, paths) {
+  const map = new Map();
+  let bytes;
+  try { bytes = git(repo, ['ls-tree', '-z', commit, '--'].concat(paths), { buffer: true }); }
+  catch (e) { return map; }
+  for (let start = 0, end; (end = bytes.indexOf(0, start)) >= 0; start = end + 1) {
+    const record = bytes.subarray(start, end).toString('utf8');
+    const tab = record.indexOf('\t');
+    if (tab < 0) continue;
+    const meta = record.slice(0, tab).split(' ');
+    if (meta.length < 3) continue;
+    map.set(record.slice(tab + 1), meta[0] + ' ' + meta[2]);
+  }
+  return map;
 }
 function isUntrackedWorktree(repo, name, trackedPaths) {
   if (!name.endsWith('/')) return false;
@@ -224,17 +260,59 @@ export function clearRecovery(repo, options = {}) {
   const target = canonical(repo);
   const removed = [];
   // 只在该笔提交确实落地、而索引可能还停在提交前时，才把索引对齐到 HEAD。
-  // 只动索引、不动工作区，且只碰这笔事务记录里的路径。
+  // 关键：失败之后用户可能已经重新暂存/修改过同一路径，这部分绝不能被 HEAD 覆盖。
+  // 事务里记了提交前的索引条目，逐个路径比一次，只修「仍是提交前旧值」的那些。
+  let repaired = true;
   if (report.transaction && report.transaction.commit && Array.isArray(report.transaction.paths) && report.transaction.paths.length) {
-    try { git(target, ['reset', '-q', 'HEAD', '--'].concat(report.transaction.paths)); report.indexRepaired = true; }
-    catch (e) { report.indexRepaired = false; report.indexError = e.message; }
+    const paths = report.transaction.paths;
+    try {
+      const skeleton = repoSkeleton(target);
+      const head = treeEntryMap(target, report.transaction.commit, paths);
+      const current = indexEntryMap(selectedIndexRecords(target, skeleton.index, paths));
+      const before = typeof report.transaction.indexBefore === 'string'
+        ? indexEntryMap(Buffer.from(report.transaction.indexBefore, 'base64'))
+        : null;
+      const stale = [], kept = [], unknown = [];
+      for (const p of paths) {
+        const now = current.get(p) || '', want = head.get(p) || '';
+        if (now === want) continue;                          // 已经和提交一致，无需修
+        if (!before) { unknown.push(p); continue; }           // 旧事务没有基线，不敢猜
+        if (now === (before.get(p) || '')) stale.push(p);     // 仍是提交前旧值：安全对齐
+        else kept.push(p);                                    // 提交后被改过/重新暂存：保持原样
+      }
+      if (unknown.length) {
+        report.indexRepaired = false;
+        report.indexError = '这次事务没有记录提交前的索引基线，无法确认这些路径是否被重新暂存，未改动索引：' + unknown.join('、');
+        repaired = false;
+      } else {
+        if (stale.length) {
+          git(target, ['reset', '-q', 'HEAD', '--'].concat(stale));
+          const after = indexEntryMap(selectedIndexRecords(target, skeleton.index, stale));
+          const bad = stale.filter(p => (after.get(p) || '') !== (head.get(p) || ''));
+          if (bad.length) throw new Error('索引对齐后仍有差异：' + bad.join('、'));
+          report.indexRepaired = true;
+          report.indexRepairedPaths = stale;
+        } else report.indexRepaired = true;
+        if (kept.length) report.indexKeptPaths = kept;
+      }
+    } catch (e) {
+      report.indexRepaired = false;
+      report.indexError = e.message;
+      repaired = false;
+    }
   }
+  // 索引没修好就不能解除门禁：否则旧索引会被当成新的反向改动提交上去，用户还以为已经清理成功。
+  if (!repaired) return { ...report, cleared: false };
   const candidates = [report.transactionFile, path.join(state, runName(target) + '.lock')];
   if (report.transaction && report.transaction.attemptFile) candidates.push(report.transaction.attemptFile);
   for (const file of candidates) {
     if (!file) continue;
     if (!path.resolve(file).startsWith(path.resolve(state) + path.sep)) continue;
     try { if (fs.existsSync(file)) { fs.unlinkSync(file); removed.push(path.basename(file)); } } catch (e) {}
+  }
+  // 事务文件删不掉就等于门禁还在，不能谎报清理成功。
+  if (report.transactionFile && fs.existsSync(report.transactionFile)) {
+    return { ...report, cleared: false, indexError: '事务文件无法删除，门禁仍然有效：' + report.transactionFile };
   }
   return { ...report, cleared: true, removed: removed };
 }
@@ -347,7 +425,10 @@ export function commit(approval) {
   const runLock = path.join(state, runName(repo) + '.lock');
   const attempt = `attempt-${key(`${repo}:${approval.id || approval.version}:${approval.message}`)}.json`;
   const transaction = transactionName(repo), transactionFile = path.join(state, transaction);
-  const transactionRecord = { status: 'prepared', repo, previousHead: before.head, branch: before.branch, approvalId: approval.id, paths: approval.paths, message: approval.message, nextIndex, workIndex, attemptFile: path.join(state, attempt), time: new Date().toISOString() };
+  // 记下「提交前这些路径在真实索引里的条目」：恢复清理时只有当前条目仍等于它，
+  // 才说明索引没被人动过、可以安全对齐到 HEAD；否则说明失败后有人重新暂存过。
+  const indexBefore = selectedIndexRecords(repo, index, approval.paths).toString('base64');
+  const transactionRecord = { status: 'prepared', repo, previousHead: before.head, branch: before.branch, approvalId: approval.id, paths: approval.paths, message: approval.message, nextIndex, workIndex, indexBefore, attemptFile: path.join(state, attempt), time: new Date().toISOString() };
   let transactionOwned = false, transactionReady = false;
   try {
     fs.closeSync(fs.openSync(runLock, 'wx')); runLocked = true;
@@ -371,6 +452,13 @@ export function commit(approval) {
     preflightIndex(index);
     const current = snapshot(repo, approval.paths);
     if ((current.version !== approval.version && !sameContent(approval, current)) || (approval.id && fs.existsSync(path.join(state, `invalid-${approval.id}.json`)))) throw new Error('准备提交期间版本已变化');
+    // 版本号只覆盖文件内容；hook 与阻断原因不在这个比对维度里。
+    // 不单独看它们的话，「初始检查通过后临时放一个 pre-commit」就能绕过门禁并且真的执行。
+    const hooksBefore = Array.isArray(approval.hooks) ? approval.hooks : [];
+    const hooksNow = Array.isArray(current.hooks) ? current.hooks : [];
+    const newHooks = hooksNow.filter(name => hooksBefore.indexOf(name) < 0);
+    if (newHooks.length) throw new Error(`准备提交期间仓库新增了提交 hook：${newHooks.join('、')}，已阻断`);
+    if (current.reasons.length) throw new Error(`准备提交期间出现阻断原因：${current.reasons.join('；')}`);
     const gate = fs.openSync(transactionFile, 'wx'); transactionOwned = true;
     try { fs.writeFileSync(gate, JSON.stringify(transactionRecord)); fs.fsyncSync(gate); } finally { fs.closeSync(gate); }
     transactionReady = true; preserve = true;
@@ -524,7 +612,9 @@ export function startMonitor(config = {}, notify) {
       }
       if (!a.repo || !repos.has(a.repo) || open.has(a.repo)) continue;
       // 窗口还开着，但内容可能已经变了：变了就不接手，让它自己提示失效
-      try { validate(a); open.set(a.repo, a); } catch (e) {}
+      // 记下窗口 PID：它不是本进程的子进程，拿不到 exit 事件，只能靠轮询感知退出，
+      // 否则用户关掉旧窗口后 open 永远为真，这个仓库就再也不提醒了。
+      try { validate(a); open.set(a.repo, { ...a, adoptedPid: live.pid }); } catch (e) {}
     }
   }
   function invalidate(repo, detail, source) {
@@ -546,30 +636,35 @@ export function startMonitor(config = {}, notify) {
     if (name && !approvalScope(a).has(name)) return;
     requestCheck();
   }
+  // 退出码是窗口把「哪种拒绝」传回来的唯一通道：3 = 本次不提交，4 = 一段时间不打扰。
+  // 其它情况（提交成功、提交失败、直接关窗、接管来的旧窗口退出）沿用旧行为：
+  // 这个版本先记一次冷却，避免立刻又弹。
+  function finishProposal(repo, a, code) {
+    open.delete(repo);
+    // 窗口已经结束，这份审批文件再没有使用方；不删就会在状态目录里越积越多。
+    try { fs.unlinkSync(path.join(state, `window-${a.id}.json`)); } catch (e) {}
+    try { fs.unlinkSync(path.join(state, `approval-${a.id}.json`)); } catch (e) {}
+    const item = tracker.items.get(repo);
+    // 用当前观测到的版本记拒绝：弹窗打开期间索引可能刷新过，用旧版本记不上冷却。
+    const version = item && item.version ? item.version : a.version;
+    if (code === 3) {
+      tracker.skip(repo, version);
+      save(`skip-${repoKey(repo)}.json`, item?.skipped || { [version]: true });
+      return;
+    }
+    if (code === 4) {
+      const until = Date.now() + cooldownSeconds * 1000;
+      tracker.snooze(repo, until);
+      save(`snooze-${repoKey(repo)}.json`, { until });
+      return;
+    }
+    tracker.reject(repo, version);
+    save(`cooldown-${repoKey(repo)}.json`, item?.rejected || { [version]: Date.now() });
+  }
   function propose(repo, s, message) {
     const a = { ...s, message, snoozeText: snoozeLabel(cooldownSeconds), id: crypto.randomUUID() }, f = `approval-${a.id}.json`;
     save(f, a); open.set(repo, a);
-    // 退出码是窗口把「哪种拒绝」传回来的唯一通道：3 = 本次不提交，4 = 一段时间不打扰。
-    // 其它情况（提交成功、提交失败、直接关窗）沿用旧行为：这个版本先记一次冷却，避免立刻又弹。
-    const finish = (code) => {
-      open.delete(repo);
-      try { fs.unlinkSync(path.join(state, `window-${a.id}.json`)); } catch (e) {}
-      const item = tracker.items.get(repo);
-      if (code === 3) {
-        tracker.skip(repo, s.version);
-        save(`skip-${repoKey(repo)}.json`, item?.skipped || { [s.version]: true });
-        return;
-      }
-      if (code === 4) {
-        const until = Date.now() + cooldownSeconds * 1000;
-        tracker.snooze(repo, until);
-        save(`snooze-${repoKey(repo)}.json`, { until });
-        return;
-      }
-      tracker.reject(repo, s.version);
-      save(`cooldown-${repoKey(repo)}.json`, item?.rejected || { [s.version]: Date.now() });
-    };
-    if (notify) { notify(a, finish); return; }
+    if (notify) { notify(a, (code) => finishProposal(repo, a, code)); return; }
     const args = ['-NoProfile', '-STA', '-File', path.join(home, 'window.ps1'), '-Approval', path.join(state, f), '-NodeExe', process.execPath];
     // 仅测试用：让弹窗自己按下指定按钮并退出，全程隐藏，避免验证时在屏幕上闪窗
     const selftest = process.env.GIT_GUARD_SELFTEST;
@@ -578,7 +673,7 @@ export function startMonitor(config = {}, notify) {
     // 记下窗口进程，重启时据此判断「屏幕上是否真的还有一个窗口在等」
     if (child.pid) save(`window-${a.id}.json`, { pid: child.pid, repo: repo, time: new Date().toISOString() });
     child.on('error', () => { open.delete(repo); tracker.items.delete(repo); });
-    child.on('exit', (code) => finish(code));
+    child.on('exit', (code) => finishProposal(repo, a, code));
   }
   function round() {
     if (stopped) return;
@@ -596,6 +691,11 @@ export function startMonitor(config = {}, notify) {
       entries = []; errors = [];
     }
     if (!adopted) adoptOpenApprovals(entries);
+    // 接手的旧窗口不是本进程的子进程：每轮轮询 PID，退了就按「直接关窗」收尾，
+    // 把 open 释放出来，否则那个仓库会被一个已经不存在的窗口永久占住。
+    for (const [repo, a] of open) {
+      if (a && a.adoptedPid && !pidAlive(a.adoptedPid)) finishProposal(repo, a, 0);
+    }
     const seen = new Set(entries.map(x => x.repo));
     // 这一轮没能解析出仓库路径（盘符忙、被杀毒软件锁住等），只是「没看到」，不等于「变了」。
     // 作废确认必须有证据：真正的内容变化由轮询比对发现，提交前 commit() 还会再校验一次。

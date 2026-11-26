@@ -326,10 +326,16 @@
       });
       if (!report.canClear) { setMsg('现在不能自动处理：' + report.reason, 'err'); return; }
       if (!window.confirm(report.reason + '\n\n清理只删掉这次没做完的收尾文件，并把相关路径的索引对齐到当前提交，不会动你工作区里的文件。继续吗？')) return;
-      await api('/api/recover', {
+      var cleared = await api('/api/recover', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: p.path, clear: true })
       });
+      // 索引没修好时后端不会删事务门禁，这里必须如实说，不能报「已清理」
+      if (!cleared || cleared.cleared === false) {
+        setMsg('没能自动清理：' + ((cleared && (cleared.indexError || cleared.reason)) || '索引没有修复') + '。门禁仍然有效，请按提示核对后再试', 'err');
+        loadAll();
+        return;
+      }
       setMsg('已清理，可以继续提交了', 'ok');
       loadAll();
     } catch (e) { setMsg(e.message, 'err'); }

@@ -1,4 +1,4 @@
-﻿# 安装 Git 静默提交助手（当前用户，不需要管理员）
+# 安装 Git 静默提交助手（当前用户，不需要管理员）
 param(
   [string]$Target = (Join-Path $env:LOCALAPPDATA 'Programs\GitQuietHelper'),
   [switch]$NoLaunch,
@@ -11,6 +11,20 @@ $srcExe = Join-Path $src 'GitQuietHelper.exe'
 if (-not (Test-Path $srcExe)) { throw '安装包不完整：同目录下找不到 GitQuietHelper.exe' }
 $version = (Get-Item $srcExe).VersionInfo.ProductVersion
 if (-not $version) { $version = (Get-Item $srcExe).VersionInfo.FileVersion }
+
+# 这个脚本会先删掉目标目录再复制：目标一旦指错，删的就是用户的资料。
+# 先把源/目标的关系与目录归属校验清楚，宁可拒绝安装也不能误删。
+$sep = [IO.Path]::DirectorySeparatorChar
+$srcFull = [IO.Path]::GetFullPath($src)
+$targetFull = [IO.Path]::GetFullPath($Target)
+if ($srcFull.Length -gt 3) { $srcFull = $srcFull.TrimEnd([char[]]@($sep)) }
+if ($targetFull.Length -gt 3) { $targetFull = $targetFull.TrimEnd([char[]]@($sep)) }
+$srcPrefix = if ($srcFull.EndsWith($sep)) { $srcFull } else { $srcFull + $sep }
+$targetPrefix = if ($targetFull.EndsWith($sep)) { $targetFull } else { $targetFull + $sep }
+if ($targetFull -eq $srcFull) { throw ('安装目标不能是安装包所在目录：' + $targetFull) }
+if ($srcFull.StartsWith($targetPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw ('安装目标不能是安装包目录的上级：' + $targetFull) }
+if ($targetFull.StartsWith($srcPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw ('安装目标不能放在安装包目录里面：' + $targetFull) }
+$Target = $targetFull
 
 Write-Host ''
 Write-Host ('正在安装 Git 静默提交助手 ' + $version)
@@ -25,6 +39,12 @@ if ($running) {
 }
 
 if (Test-Path $Target) {
+  # 只清理「确认是本软件安装目录」的目录：有主程序，且带卸载脚本。
+  # 少一个都可能是用户自己的文件夹，直接递归删除是数据事故。
+  $looksInstalled = (Test-Path (Join-Path $Target 'GitQuietHelper.exe')) -and (Test-Path (Join-Path $Target 'uninstall.ps1'))
+  if (-not $looksInstalled) {
+    throw ('目标目录已经存在，但不像是本软件的安装目录，已停止以免误删：' + $Target + '。请换一个空目录，或先手动清理。')
+  }
   Write-Host '  清理上一次安装'
   Remove-Item $Target -Recurse -Force
 }

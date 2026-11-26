@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
+import http from 'node:http';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const folder = path.dirname(fileURLToPath(import.meta.url));
@@ -11,7 +12,7 @@ const base = fs.mkdtempSync(path.resolve('.tmp/git-guard-tests-'));
 process.env.GIT_GUARD_STATE = path.join(base, 'state');
 process.env.GIT_CONFIG_GLOBAL = process.platform === 'win32' ? 'NUL' : '/dev/null';
 process.env.GIT_CONFIG_NOSYSTEM = '1';
-const { snapshot, commit, scan, marker, busy, Tracker, createApproval, validate, startMonitor, defaultMessage, sameContent, contentDiff } = await import('./guard.mjs');
+const { snapshot, commit, scan, marker, busy, Tracker, createApproval, validate, startMonitor, defaultMessage, sameContent, contentDiff, recoveryReport, clearRecovery, useStateDir } = await import('./guard.mjs');
 const { inspectPrereqs, pickGitAsset, pickPowerShellMsi, pickMirrorGitTag, mirrorGitAsset } = await import('./prereq.mjs');
 let number = 0;
 function run(cwd, cmd, args, extra = {}) { const p = spawnSync(cmd, args, { cwd, encoding: 'utf8', env: { ...process.env, ...extra }, windowsHide: true, timeout: 45000 }); if (p.status !== 0) throw new Error(`${cmd}: ${p.error?.message || p.stderr || p.stdout}`); return p.stdout.trim(); }
@@ -560,6 +561,10 @@ console.log(`隔离夹具：${base}`);
 
 test('自启动开关：写配置、调宿主、浏览器模式如实说不支持', async () => {
   const { startPanel } = await import('./panel.mjs');
+  // startPanel 会把 guard 的状态目录切到 dataDir/state；测完必须还原，
+  // 否则后面的用例会把事务/审批写到别的目录里。
+  const originalState = process.env.GIT_GUARD_STATE;
+  try {
   const dir = fs.mkdtempSync(path.join(base, 'panel-'));
   const calls = [];
   const panel = await startPanel({
@@ -592,6 +597,9 @@ test('自启动开关：写配置、调宿主、浏览器模式如实说不支�
     assert.equal(r.supported, false);
     assert.ok(r.note && r.note.indexOf('浏览器') >= 0);
   } finally { plain.stop(); }
+  } finally {
+    useStateDir(originalState);
+  }
 });
 
 test('自动提交通知只对新的 notify 提交触发一次', async () => {
@@ -618,4 +626,222 @@ test('自动提交通知只对新的 notify 提交触发一次', async () => {
     w.poll();
     assert.deepEqual(got, ['aaa', 'ccc']);
   } finally { w.stop(); }
+});
+
+test('恢复清理不会覆盖失败后重新暂存的内容', () => {
+  const r = fixture();
+  const h0 = git(r, 'rev-parse', 'HEAD');
+  // 模拟：提交已经落地（h1），但索引发布失败，事务停在 committed
+  write(r, 'a.txt', 'committed');
+  git(r, 'add', 'a.txt'); git(r, 'commit', '-qm', 'landed');
+  const h1 = git(r, 'rev-parse', 'HEAD');
+  // 用户随后又对同一路径重新暂存，工作区再改一次：这两份内容都不能被清理动作覆盖
+  write(r, 'a.txt', 'later staged');
+  git(r, 'add', 'a.txt');
+  write(r, 'a.txt', 'later worktree');
+  // 提交前索引基线：h0 时 a.txt 的条目
+  const tmpIndex = path.join(base, 'base-index-' + crypto.randomUUID());
+  run(r, 'git', ['read-tree', h0], { GIT_INDEX_FILE: tmpIndex });
+  const beforeText = run(r, 'git', ['ls-files', '--stage', '-z'], { GIT_INDEX_FILE: tmpIndex });
+  fs.unlinkSync(tmpIndex);
+  const canonicalRepo = snapshot(r).repo;
+  const key = digest(canonicalRepo);
+  fs.mkdirSync(process.env.GIT_GUARD_STATE, { recursive: true });
+  const txFile = path.join(process.env.GIT_GUARD_STATE, 'transaction-' + key + '.json');
+  fs.writeFileSync(txFile, JSON.stringify({
+    status: 'committed', repo: canonicalRepo, previousHead: h0, commit: h1, paths: ['a.txt'],
+    indexBefore: Buffer.from(beforeText, 'utf8').toString('base64'), time: new Date().toISOString()
+  }));
+  const result = clearRecovery(r);
+  assert.equal(result.cleared, true);
+  assert.equal(git(r, 'show', ':a.txt'), 'later staged', '重新暂存的内容必须原样保留');
+  assert.equal(fs.readFileSync(path.join(r, 'a.txt'), 'utf8'), 'later worktree', '工作区不能被改动');
+  assert.equal(fs.existsSync(txFile), false, '清理完成后事务文件应删除');
+});
+
+test('索引对齐失败时保持事务门禁，不谎报已清理', () => {
+  const r = fixture();
+  const head = git(r, 'rev-parse', 'HEAD');
+  write(r, 'a.txt', 'stale');
+  const canonicalRepo = snapshot(r).repo;
+  const key = digest(canonicalRepo);
+  fs.mkdirSync(process.env.GIT_GUARD_STATE, { recursive: true });
+  const txFile = path.join(process.env.GIT_GUARD_STATE, 'transaction-' + key + '.json');
+  const index = path.join(r, '.git', 'index');
+  const backup = index + '.bak';
+  fs.writeFileSync(txFile, JSON.stringify({
+    status: 'prepared', repo: canonicalRepo, previousHead: head, commit: head, paths: ['a.txt'],
+    indexBefore: '', time: new Date().toISOString()
+  }));
+  // 把索引换成目录：git 读不了索引，恢复动作不可能对齐
+  fs.renameSync(index, backup);
+  fs.mkdirSync(index);
+  let result;
+  try {
+    assert.equal(recoveryReport(r).canClear, true, '恢复诊断本身应认为可以清理');
+    result = clearRecovery(r);
+  } finally {
+    fs.rmdirSync(index);
+    fs.renameSync(backup, index);
+  }
+  assert.equal(result.cleared, false, '索引没修好不能报 cleared');
+  assert.equal(result.indexRepaired, false);
+  assert.ok(result.indexError);
+  assert.equal(fs.existsSync(txFile), true, '门禁必须保留');
+  fs.unlinkSync(txFile);
+});
+
+test('准备提交期间新增的 hook 会被最终检查拦住且不执行', async () => {
+  const r = fixture(); write(r, 'a.txt', 'hook race');
+  const a = createApproval(r, ['a.txt'], 'hook race');
+  fs.mkdirSync(process.env.GIT_GUARD_STATE, { recursive: true });
+  const approvalFile = path.join(process.env.GIT_GUARD_STATE, 'approval-' + a.id + '.json');
+  fs.writeFileSync(approvalFile, JSON.stringify(a));
+  assert.ok(fs.existsSync(approvalFile));
+  const hookDir = path.join(r, '.git', 'hooks');
+  fs.mkdirSync(hookDir, { recursive: true });
+  const markerFile = path.join(r, 'hook-ran.txt');
+  const hookBody = '#!/bin/sh\n: > "' + markerFile.replace(/\\/g, '/') + '"\nexit 0\n';
+  const stateDir = process.env.GIT_GUARD_STATE;
+  // 同一个状态目录里可能躺着前一条故障注入用例留下的 work 索引，
+  // 必须只认这次提交新出现的那个，否则 hook 会在初始 validate 之前就被写进去。
+  const staleWorkIndexes = new Set();
+  try { for (const n of fs.readdirSync(stateDir)) if (/^work-.*\.index$/.test(n)) staleWorkIndexes.add(n); } catch (e) {}
+  const workIndexPresent = () => {
+    try { return fs.readdirSync(stateDir).some(n => /^work-.*\.index$/.test(n) && !staleWorkIndexes.has(n)); } catch (e) { return false; }
+  };
+  let hookWritten = false;
+  const writeHook = () => {
+    if (hookWritten) return;
+    try { fs.writeFileSync(path.join(hookDir, 'pre-commit'), hookBody); hookWritten = true; } catch (e) {}
+  };
+  let watcher = null;
+  try { watcher = fs.watch(stateDir, () => { if (workIndexPresent()) writeHook(); }); } catch (e) {}
+  const child = spawn(process.execPath, [path.join(folder, 'guard.mjs'), 'commit', '--approval', approvalFile], { cwd: folder, windowsHide: true });
+  let out = '', err = '';
+  child.stdout.on('data', d => { out += d; });
+  child.stderr.on('data', d => { err += d; });
+  const exited = new Promise(resolve => child.on('exit', resolve));
+  const poll = (async () => {
+    for (let i = 0; i < 4000 && child.exitCode === null && !hookWritten; i++) {
+      if (workIndexPresent()) writeHook();
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+  })();
+  const code = await exited;
+  await poll;
+  if (watcher) watcher.close();
+  try { fs.unlinkSync(path.join(hookDir, 'pre-commit')); } catch (e) {}
+  assert.equal(hookWritten, true, '测试没能把 hook 注入到暂存和最终检查之间');
+  assert.notEqual(code, 0, '新增 hook 后提交必须被阻断');
+  assert.match(String(out) + String(err), /新增了提交 hook/);
+  assert.equal(fs.existsSync(markerFile), false, '被拦住的 hook 不能真的执行');
+  assert.equal(git(r, 'log', '-1', '--pretty=%s'), 'base');
+});
+
+test('接管的旧窗口退出后不会永久占住仓库', async () => {
+  const r = fixture();
+  write(r, 'a.txt', '待提交');
+  const old = new Date(Date.now() - 3 * 3600 * 1000);
+  fs.utimesSync(path.join(r, 'a.txt'), old, old);
+  const a = { ...snapshot(r), message: 'adopted', id: crypto.randomUUID() };
+  const stateDir = process.env.GIT_GUARD_STATE;
+  fs.mkdirSync(stateDir, { recursive: true });
+  const approvalFile = path.join(stateDir, 'approval-' + a.id + '.json');
+  const windowFile = path.join(stateDir, 'window-' + a.id + '.json');
+  fs.writeFileSync(approvalFile, JSON.stringify(a));
+  const sleeper = spawn(process.execPath, ['-e', 'setTimeout(function(){}, 60000)'], { stdio: 'ignore', windowsHide: true });
+  try {
+    fs.writeFileSync(windowFile, JSON.stringify({ pid: sleeper.pid, repo: a.repo }));
+    let fired = 0;
+    const m = startMonitor({ projects: [{ path: r, enabled: true }], idleSeconds: 600, pollSeconds: 1 }, (x, done) => { fired++; if (done) done(); });
+    try {
+      await new Promise(resolve => setTimeout(resolve, 2500));
+      assert.equal(fired, 0, '旧窗口还活着时不该重复弹');
+      assert.ok(fs.existsSync(approvalFile), '接管后审批应还在');
+      sleeper.kill();
+      await new Promise(resolve => sleeper.exitCode !== null ? resolve() : sleeper.once('exit', resolve));
+      await new Promise(resolve => setTimeout(resolve, 2500));
+      assert.equal(fs.existsSync(approvalFile), false, '窗口退出后审批应被清掉，不能永久占用');
+      assert.equal(fs.existsSync(windowFile), false, '窗口记录也应清掉');
+    } finally { m.close(); }
+  } finally {
+    try { sleeper.kill(); } catch (e) {}
+  }
+});
+
+test('面板拒绝异常 Host、跨源和非 JSON 的写请求', async () => {
+  const { startPanel } = await import('./panel.mjs');
+  const original = process.env.GIT_GUARD_STATE;
+  const dir = fs.mkdtempSync(path.join(base, 'panel-sec-'));
+  const panel = await startPanel({ port: 0, dataDir: dir });
+  try {
+    const port = panel.port;
+    const raw = (opts) => new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port: port, path: opts.path, method: opts.method, headers: opts.headers }, res => {
+        let data = ''; res.on('data', d => { data += d; }); res.on('end', () => resolve({ status: res.statusCode, body: data }));
+      });
+      req.on('error', reject);
+      if (opts.body) req.write(opts.body);
+      req.end();
+    });
+    const body = '{}';
+    const ok = await raw({ path: '/api/config', method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) }, body: body });
+    assert.equal(ok.status, 200, '本机正常请求应通过');
+    const plain = await raw({ path: '/api/config', method: 'POST', headers: { 'content-type': 'text/plain', 'content-length': Buffer.byteLength(body) }, body: body });
+    assert.equal(plain.status, 415, '网页可用简单请求绕过预检，必须要求 JSON');
+    const cross = await raw({ path: '/api/config', method: 'POST', headers: { 'content-type': 'application/json', origin: 'https://evil.example', 'content-length': Buffer.byteLength(body) }, body: body });
+    assert.equal(cross.status, 403, '跨源 Origin 必须拒绝');
+    const badHost = await raw({ path: '/api/status', method: 'GET', headers: { host: 'evil.example:' + port } });
+    assert.equal(badHost.status, 403, '非本机 Host（DNS rebinding）必须拒绝');
+  } finally {
+    panel.stop();
+    useStateDir(original);
+  }
+});
+
+test('打包版面板与监视器共用 dataDir 里的状态目录', async () => {
+  const { startPanel } = await import('./panel.mjs');
+  const original = process.env.GIT_GUARD_STATE;
+  const root = fs.mkdtempSync(path.join(base, 'panel-state-'));
+  const dataDir = path.join(root, 'data');
+  const stateDir = path.join(dataDir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const repo = path.join(root, 'repo'); fs.mkdirSync(repo);
+  const real = path.normalize(fs.realpathSync.native(path.resolve(repo)));
+  const canonicalRepo = process.platform === 'win32' ? real.toLowerCase().replace(/^[a-z]:/, d => d.toUpperCase()) : real;
+  const key = crypto.createHash('sha256').update(Buffer.from(canonicalRepo)).digest('hex');
+  fs.writeFileSync(path.join(stateDir, 'transaction-' + key + '.json'), JSON.stringify({
+    status: 'prepared', repo: canonicalRepo, previousHead: null, paths: ['a.txt'], time: new Date().toISOString()
+  }));
+  const panel = await startPanel({ port: 0, dataDir: dataDir });
+  try {
+    const res = await fetch(panel.url + 'api/recover', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: repo }) });
+    const result = await res.json();
+    assert.equal(res.status, 200);
+    assert.ok(result.transaction, '面板必须看到 dataDir/state 里的事务门禁');
+    assert.equal(path.resolve(result.stateDir).toLowerCase(), path.resolve(stateDir).toLowerCase());
+  } finally {
+    panel.stop();
+    useStateDir(original);
+  }
+});
+
+test('安装脚本拒绝删除已有非安装目录并拒绝源=目标', () => {
+  const root = fs.mkdtempSync(path.join(base, 'install-'));
+  const src = path.join(root, 'pkg'); fs.mkdirSync(src);
+  const helper = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'where.exe');
+  assert.ok(fs.existsSync(helper));
+  fs.copyFileSync(helper, path.join(src, 'GitQuietHelper.exe'));
+  fs.copyFileSync(path.join(folder, '..', '..', '安装包', 'install.ps1'), path.join(src, 'install.ps1'));
+  const target = path.join(root, 'user-dir'); fs.mkdirSync(target);
+  fs.writeFileSync(path.join(target, 'keep.txt'), 'do not delete');
+  const first = spawnRaw(src, 'pwsh', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(src, 'install.ps1'), '-Target', target, '-NoLaunch']);
+  assert.notEqual(first.status, 0, '不认识的目录必须拒绝安装');
+  // pwsh 重定向输出在本机走控制台代码页，中文可能解不回来；这里只确认它确实撞在安装脚本的检查上
+  assert.match(String(first.stderr || ''), /install\.ps1/);
+  assert.equal(fs.readFileSync(path.join(target, 'keep.txt'), 'utf8'), 'do not delete', '用户文件夹必须原样保留');
+  const second = spawnRaw(src, 'pwsh', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(src, 'install.ps1'), '-Target', src, '-NoLaunch']);
+  assert.notEqual(second.status, 0, '源目录不能当安装目标');
+  assert.ok(fs.existsSync(path.join(src, 'GitQuietHelper.exe')), '安装包自身不能被删');
 });
