@@ -1,6 +1,6 @@
 {
   "name": "git-quiet-helper",
-  "version": "0.8.13",
+  "version": "0.8.14",
   "description": "Windows 托盘工具：监视指定的 Git 仓库，等你停手后提醒或自动提交，免得忘了提交把改动攒丢。",
   "license": "MIT",
   "type": "module",

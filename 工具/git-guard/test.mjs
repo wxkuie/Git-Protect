@@ -11,7 +11,7 @@ const base = fs.mkdtempSync(path.resolve('.tmp/git-guard-tests-'));
 process.env.GIT_GUARD_STATE = path.join(base, 'state');
 process.env.GIT_CONFIG_GLOBAL = process.platform === 'win32' ? 'NUL' : '/dev/null';
 process.env.GIT_CONFIG_NOSYSTEM = '1';
-const { snapshot, commit, scan, marker, busy, Tracker, createApproval, validate, startMonitor, defaultMessage } = await import('./guard.mjs');
+const { snapshot, commit, scan, marker, busy, Tracker, createApproval, validate, startMonitor, defaultMessage, sameContent, contentDiff } = await import('./guard.mjs');
 const { inspectPrereqs, pickGitAsset, pickPowerShellMsi, pickMirrorGitTag, mirrorGitAsset } = await import('./prereq.mjs');
 let number = 0;
 function run(cwd, cmd, args, extra = {}) { const p = spawnSync(cmd, args, { cwd, encoding: 'utf8', env: { ...process.env, ...extra }, windowsHide: true, timeout: 45000 }); if (p.status !== 0) throw new Error(`${cmd}: ${p.error?.message || p.stderr || p.stdout}`); return p.stdout.trim(); }
@@ -306,6 +306,42 @@ test('GitHub 连不上时退国内镜像，按目录列表挑最新版本', () =
   assert.equal(pickMirrorGitTag([{ name: 'v1.0.0/' }]), null, '不完整的版本号不算');
 });
 
+
+test('改无关文件不作废确认，改批准的文件才作废并说清是哪个', async () => {
+  const r = fixture(); write(r, 'a.txt', 'approved'); write(r, 'b.txt', 'other');
+  const a = { ...snapshot(r, ['a.txt']), message: 'scope test' };
+  // 只改了 b.txt（不在批准范围内）——这份确认仍然有效，提交也只提交 a.txt
+  write(r, 'b.txt', 'other changed');
+  assert.equal(sameContent(a, snapshot(r, ['a.txt'])), true, '无关文件变化不该作废确认');
+  // 批准的那个文件被改了，才必须作废，并且提示里要带出文件名
+  write(r, 'a.txt', 'approved changed');
+  const now = snapshot(r, ['a.txt']);
+  assert.equal(sameContent(a, now), false, '批准的文件变了必须作废');
+  assert.deepEqual(contentDiff(a, now), ['a.txt']);
+});
+
+test('监听无关文件不作废确认，只有确认覆盖的文件变了才作废', async () => {
+  const r = fixture(); write(r, 'a.txt', 'approved');
+  const got = [];
+  const m = startMonitor({ projects: [{ path: r, enabled: true }], idleSeconds: 600, pollSeconds: 1800 }, (a) => got.push(a));
+  try {
+    const repo = snapshot(r).repo;
+    m.tracker.items.get(repo).since = Date.now() - 601000;
+    for (let i = 0; i < 80 && !got.length; i++) { await new Promise(res => setTimeout(res, 100)); m.check(); }
+    assert.equal(got.length, 1, '应先弹出一份确认');
+    const a = got[0];
+    assert.deepEqual(a.paths, ['a.txt'], '这份确认只覆盖 a.txt');
+    // 在同一个仓库里新建别的文件：不该作废这份确认
+    write(r, 'b.txt', 'unrelated work');
+    await new Promise(res => setTimeout(res, 400));
+    validate(a);
+    // 确认覆盖的那个文件真的改了，才必须作废，并说清是哪个文件
+    write(r, 'a.txt', 'approved changed');
+    await new Promise(res => setTimeout(res, 400));
+    assert.throws(() => validate(a), /旧确认失效/);
+    assert.throws(() => validate(a), /a\.txt/);
+  } finally { m.close(); }
+});
 
 test('包名必须固定：它决定用户配置目录，改名会让老配置看起来丢了', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));

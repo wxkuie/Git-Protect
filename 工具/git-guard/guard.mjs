@@ -267,19 +267,43 @@ export function ensureIdentity(repo) {
 
 // 版本号里含 .git/index 的哈希，而 git 只要刷新一次 stat 缓存就会改它（这是常态，不是用户改动）。
 // 所以版本变化时还要看内容到底变没变：文件状态码、路径、内容哈希、HEAD、分支都没变，就不该作废确认。
+function approvalScope(a) {
+  const paths = Array.isArray(a && a.paths) ? a.paths : [];
+  return new Set(paths.length ? paths : (a && a.changes || []).map(x => x.path));
+}
+// 只比这份确认真正覆盖的文件：弹窗上列的是哪几个文件，就只对哪几个负责。
+// 以前拿整仓改动比，用户在同一个仓库里改了别的文件，这份确认就被判失效——
+// 但提交本来也只提交列出的那些路径（提交树由 workIndex 单独构建），无关文件变不变都不影响结果。
 export function sameContent(a, b) {
   if (!a || !b) return false;
   if (a.repo !== b.repo || a.head !== b.head || a.branch !== b.branch) return false;
+  const scope = approvalScope(a);
   const key = x => x.code + '\0' + x.path + '\0' + x.hash;
-  const left = (a.changes || []).map(key).sort().join('\n');
-  const right = (b.changes || []).map(key).sort().join('\n');
-  return left === right;
+  const pick = list => (list || []).filter(x => scope.has(x.path)).map(key).sort().join('\n');
+  return pick(a.changes) === pick(b.changes);
+}
+// 给用户看清楚「是哪个文件变了」，而不是只丢一句「有修改」
+export function contentDiff(a, b) {
+  const scope = approvalScope(a);
+  const key = x => x.code + '\0' + x.path + '\0' + x.hash;
+  const before = new Map((a && a.changes || []).filter(x => scope.has(x.path)).map(x => [x.path, key(x)]));
+  const after = new Map((b && b.changes || []).filter(x => scope.has(x.path)).map(x => [x.path, key(x)]));
+  const changed = [];
+  for (const [path, k] of before) { const now = after.get(path); if (now === undefined) changed.push(`${path}（已还原或移出）`); else if (now !== k) changed.push(path); }
+  for (const path of after.keys()) if (!before.has(path)) changed.push(path);
+  return changed;
 }
 
 export function validate(approval) {
   if (!Array.isArray(approval.paths) || !approval.paths.length) throw new Error('必须明确指定非空文件范围');
   ensureIdentity(approval.repo);
-  if (approval.id && fs.existsSync(path.join(state, `invalid-${approval.id}.json`))) throw new Error('弹窗后观察到修改，旧确认失效');
+  if (approval.id) {
+    const invalid = load(`invalid-${approval.id}.json`);
+    if (invalid) {
+      const where = invalid.detail ? `（${invalid.detail}）` : '';
+      throw new Error(`弹窗后观察到修改${where}，旧确认失效`);
+    }
+  }
   if (fs.existsSync(path.join(state, transactionName(approval.repo)))) throw new Error(`前次提交事务尚未完成，门禁保持：${path.join(state, transactionName(approval.repo))}`);
   if (load(`recovery-${repoKey(approval.repo)}.json`)) throw new Error('前次提交需要人工检查索引恢复记录');
   const s = snapshot(approval.repo, approval.paths);
@@ -501,7 +525,19 @@ export function startMonitor(config = {}, notify) {
       try { validate(a); open.set(a.repo, a); } catch (e) {}
     }
   }
-  function invalidate(repo) { tracker.changed(repo); const a = open.get(repo); if (a) save(`invalid-${a.id}.json`, { reason: '弹窗期间观察到修改', time: new Date().toISOString() }); }
+  function invalidate(repo, detail) {
+    tracker.changed(repo);
+    const a = open.get(repo);
+    if (a) save(`invalid-${a.id}.json`, { reason: '弹窗期间观察到修改', detail: detail || '', time: new Date().toISOString() });
+  }
+  // 文件监听只对「这份确认覆盖的路径」作废：在同一个仓库里改别的文件，不该让已经弹出来的确认失效。
+  // 停手计时照样重置——用户还在动这个仓库，就不算停手。
+  function watcherChanged(repo, name) {
+    const a = open.get(repo);
+    if (!a) { tracker.changed(repo); return; }
+    if (name && !approvalScope(a).has(name)) { tracker.changed(repo); return; }
+    invalidate(repo, name || '');
+  }
   function propose(repo, s, message) {
     const a = { ...s, message, snoozeText: snoozeLabel(cooldownSeconds), id: crypto.randomUUID() }, f = `approval-${a.id}.json`;
     save(f, a); open.set(repo, a);
@@ -569,7 +605,10 @@ export function startMonitor(config = {}, notify) {
         const snoozed = load(`snooze-${repoKey(repo)}.json`, null);
         if (snoozed && Number.isFinite(snoozed.until)) observed.snoozeUntil = Math.max(observed.snoozeUntil || 0, snoozed.until);
         // 内容没变、只是 git 刷新了索引（版本号变但内容相同）时，作废弹窗只会让人白点一次
-        if (open.has(repo) && !sameContent(open.get(repo), s)) invalidate(repo);
+        if (open.has(repo) && !sameContent(open.get(repo), s)) {
+          const diff = contentDiff(open.get(repo), s);
+          invalidate(repo, diff.slice(0, 3).join('、') + (diff.length > 3 ? ` 等 ${diff.length} 个文件` : ''));
+        }
         if (!watchers.has(repo)) {
           try {
             const w = fs.watch(repo, { recursive: true }, (event, name) => {
@@ -578,9 +617,9 @@ export function startMonitor(config = {}, notify) {
               // 以前这条判断是「命中 .git 就失效」，于是每轮轮询都被自己的动作清零——
               // 停手计时永远到不了，有未提交改动的仓库永远不提醒，已弹出的确认也会被判失效。
               // 真实的提交/切分支由 30 秒轮询比对版本号发现，不依赖这个目录。
-              if (!n) invalidate(repo);
+              if (!n) watcherChanged(repo, '');
               else if (/(^|\/)\.git(\/|$)/.test(n)) { /* .git 内部改动不算工作区改动 */ }
-              else if (!excluded(repo, n)) invalidate(repo);
+              else if (!excluded(repo, n)) watcherChanged(repo, n);
             });
             w.on('error', () => { invalidate(repo); w.close(); watchers.delete(repo); tracker.items.delete(repo); }); watchers.set(repo, w);
           } catch { tracker.items.delete(repo); continue; }
