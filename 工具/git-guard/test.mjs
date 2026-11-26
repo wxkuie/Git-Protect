@@ -348,6 +348,21 @@ test('监听无关文件不作废确认，只有确认覆盖的文件变了才�
   } finally { m.close(); }
 });
 
+test('外部 git 刷新索引 stat（内容没变）时确认仍有效且能提交', async () => {
+  const r = fixture(); write(r, 'a.txt', 'ready');
+  const a = createApproval(r, ['a.txt'], 'stat refresh');
+  // 模拟：编辑器/IDE 碰过一个「不在提交范围里、内容也没改」的已跟踪文件，随后外部 git status 刷新索引 stat
+  const old = new Date('2001-01-01T00:00:00Z');
+  fs.utimesSync(path.join(r, 'b.txt'), old, old);
+  spawnRaw(r, 'git', ['status', '--porcelain']);
+  const after = snapshot(r, ['a.txt']);
+  assert.notEqual(after.version, a.version, '前提：索引确实被刷新，version 应当变化');
+  assert.equal(sameContent(a, after), true, '内容没变');
+  validate(a);                        // 弹窗每 3 秒做的就是这个：必须通过
+  commit(a);                          // 以前这里会抛「版本已变化，旧确认失效」
+  assert.equal(git(r, 'log', '-1', '--pretty=%s'), 'stat refresh');
+});
+
 test('包名必须固定：它决定用户配置目录，改名会让老配置看起来丢了', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
   assert.equal(pkg.name, 'git-quiet-helper',

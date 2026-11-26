@@ -334,7 +334,9 @@ export function commit(approval) {
   // 两次快照之间没有任何写操作，重算一次只是多花约 1 秒。
   const before = validate(approval);
   const repo = before.repo;
-  if (before.version !== approval.version) throw new Error('版本已变化，旧确认失效');
+  // 必须和 validate() 用同一把尺子：version 里含索引哈希，外部 git 进程刷新一次 stat（内容没变）
+  // 就会让 version 变化。这里若严格比对，弹窗会一直显示可提交、点下去却永远失败。
+  if (before.version !== approval.version && !sameContent(approval, before)) throw new Error('版本已变化，旧确认失效');
   if (before.reasons.length) throw new Error(before.reasons.join('；'));
   if (busy(repo)) throw new Error('运行标记尚未结束');
   if (!approval.message || /[\r\n]/.test(approval.message)) throw new Error('提交说明不能为空且须为单行');
