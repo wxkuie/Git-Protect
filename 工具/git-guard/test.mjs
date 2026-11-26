@@ -628,35 +628,58 @@ test('自动提交通知只对新的 notify 提交触发一次', async () => {
   } finally { w.stop(); }
 });
 
-test('恢复清理不会覆盖失败后重新暂存的内容', () => {
+test('恢复清理只对齐仍停在提交前的索引项，保留重新暂存的内容', () => {
   const r = fixture();
   const h0 = git(r, 'rev-parse', 'HEAD');
-  // 模拟：提交已经落地（h1），但索引发布失败，事务停在 committed
-  write(r, 'a.txt', 'committed');
-  git(r, 'add', 'a.txt'); git(r, 'commit', '-qm', 'landed');
+  // 提交前索引基线：此刻索引就是 h0，直接记下两个文件的条目
+  const baseline = run(r, 'git', ['ls-files', '--stage', '-z']);
+  // 模拟：提交已经落地（h1，a、b 都变了），但索引发布失败，事务停在 committed
+  write(r, 'a.txt', 'committed a'); write(r, 'b.txt', 'committed b');
+  git(r, 'add', 'a.txt', 'b.txt'); git(r, 'commit', '-qm', 'landed');
   const h1 = git(r, 'rev-parse', 'HEAD');
-  // 用户随后又对同一路径重新暂存，工作区再改一次：这两份内容都不能被清理动作覆盖
-  write(r, 'a.txt', 'later staged');
-  git(r, 'add', 'a.txt');
+  // 失败后用户重新暂存 a（必须原样保留）；b 仍停在提交前旧值（应对齐到新提交）
+  write(r, 'a.txt', 'later staged'); git(r, 'add', 'a.txt');
+  const blobB0 = git(r, 'rev-parse', h0 + ':b.txt');
+  git(r, 'update-index', '--cacheinfo', '100644,' + blobB0 + ',b.txt');
   write(r, 'a.txt', 'later worktree');
-  // 提交前索引基线：h0 时 a.txt 的条目
-  const tmpIndex = path.join(base, 'base-index-' + crypto.randomUUID());
-  run(r, 'git', ['read-tree', h0], { GIT_INDEX_FILE: tmpIndex });
-  const beforeText = run(r, 'git', ['ls-files', '--stage', '-z'], { GIT_INDEX_FILE: tmpIndex });
-  fs.unlinkSync(tmpIndex);
   const canonicalRepo = snapshot(r).repo;
   const key = digest(canonicalRepo);
   fs.mkdirSync(process.env.GIT_GUARD_STATE, { recursive: true });
   const txFile = path.join(process.env.GIT_GUARD_STATE, 'transaction-' + key + '.json');
   fs.writeFileSync(txFile, JSON.stringify({
-    status: 'committed', repo: canonicalRepo, previousHead: h0, commit: h1, paths: ['a.txt'],
-    indexBefore: Buffer.from(beforeText, 'utf8').toString('base64'), time: new Date().toISOString()
+    status: 'committed', repo: canonicalRepo, previousHead: h0, commit: h1, paths: ['a.txt', 'b.txt'],
+    indexBefore: Buffer.from(baseline, 'utf8').toString('base64'), time: new Date().toISOString()
   }));
   const result = clearRecovery(r);
   assert.equal(result.cleared, true);
+  assert.deepEqual(result.indexRepairedPaths, ['b.txt'], '只有停在旧值的 b 应对齐');
+  assert.deepEqual(result.indexKeptPaths, ['a.txt'], '重新暂存的 a 应保持原样');
   assert.equal(git(r, 'show', ':a.txt'), 'later staged', '重新暂存的内容必须原样保留');
+  assert.equal(git(r, 'show', ':b.txt'), 'committed b', '停在旧值的索引应对齐到提交内容');
   assert.equal(fs.readFileSync(path.join(r, 'a.txt'), 'utf8'), 'later worktree', '工作区不能被改动');
+  assert.equal(fs.readFileSync(path.join(r, 'b.txt'), 'utf8'), 'committed b', '工作区不能被改动');
   assert.equal(fs.existsSync(txFile), false, '清理完成后事务文件应删除');
+});
+
+test('旧事务没有索引基线时不自动清理', () => {
+  const r = fixture();
+  const h0 = git(r, 'rev-parse', 'HEAD');
+  write(r, 'b.txt', 'committed b'); git(r, 'add', 'b.txt'); git(r, 'commit', '-qm', 'landed');
+  const h1 = git(r, 'rev-parse', 'HEAD');
+  const blobB0 = git(r, 'rev-parse', h0 + ':b.txt');
+  git(r, 'update-index', '--cacheinfo', '100644,' + blobB0 + ',b.txt');
+  const canonicalRepo = snapshot(r).repo;
+  const key = digest(canonicalRepo);
+  fs.mkdirSync(process.env.GIT_GUARD_STATE, { recursive: true });
+  const txFile = path.join(process.env.GIT_GUARD_STATE, 'transaction-' + key + '.json');
+  fs.writeFileSync(txFile, JSON.stringify({ status: 'committed', repo: canonicalRepo, previousHead: h0, commit: h1, paths: ['b.txt'], time: new Date().toISOString() }));
+  const result = clearRecovery(r);
+  assert.equal(result.cleared, false, '没有基线不能猜，必须保持门禁');
+  assert.equal(result.indexRepaired, false);
+  assert.match(result.indexError, /基线/);
+  assert.equal(git(r, 'rev-parse', ':b.txt'), blobB0, '拒绝清理时索引不能被改动');
+  assert.equal(fs.existsSync(txFile), true, '门禁必须保留');
+  fs.unlinkSync(txFile);
 });
 
 test('索引对齐失败时保持事务门禁，不谎报已清理', () => {

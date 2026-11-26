@@ -67,7 +67,8 @@ function treeEntryMap(repo, commit, paths) {
     if (tab < 0) continue;
     const meta = record.slice(0, tab).split(' ');
     if (meta.length < 3) continue;
-    map.set(record.slice(tab + 1), meta[0] + ' ' + meta[2]);
+    // 树里的条目没有 stage 概念，对齐时按索引条目的格式补一个 stage 0，否则永远比不相等。
+    map.set(record.slice(tab + 1), meta[0] + ' ' + meta[2] + ' 0');
   }
   return map;
 }
