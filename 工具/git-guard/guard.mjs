@@ -525,18 +525,24 @@ export function startMonitor(config = {}, notify) {
       try { validate(a); open.set(a.repo, a); } catch (e) {}
     }
   }
-  function invalidate(repo, detail) {
+  function invalidate(repo, detail, source) {
     tracker.changed(repo);
     const a = open.get(repo);
-    if (a) save(`invalid-${a.id}.json`, { reason: '弹窗期间观察到修改', detail: detail || '', time: new Date().toISOString() });
+    const why = source || 'unknown';
+    // 每次作废都留一行来源，出问题才追得下去：轮询发现内容变了、文件监听、还是解析仓库失败
+    if (a) console.error(`[作废] ${repo} 来源=${why} 细节=${detail || '(未记录)'}`);
+    if (a) save(`invalid-${a.id}.json`, { reason: '弹窗期间观察到修改', detail: detail || '', source: why, time: new Date().toISOString() });
   }
-  // 文件监听只对「这份确认覆盖的路径」作废：在同一个仓库里改别的文件，不该让已经弹出来的确认失效。
-  // 停手计时照样重置——用户还在动这个仓库，就不算停手。
+  // 文件监听只用来「提醒去看一眼」，不作最终判决：
+  // 它给不出内容，只能证明「这个文件被碰过」，写一遍相同内容也会触发。
+  // 所以覆盖范围内的变动交回轮询按内容哈希判断，覆盖范围外的连复查都不用。
+  // 停手计时两种情况都要重置——用户还在动这个仓库，就不算停手。
   function watcherChanged(repo, name) {
+    tracker.changed(repo);
     const a = open.get(repo);
-    if (!a) { tracker.changed(repo); return; }
-    if (name && !approvalScope(a).has(name)) { tracker.changed(repo); return; }
-    invalidate(repo, name || '');
+    if (!a) return;
+    if (name && !approvalScope(a).has(name)) return;
+    requestCheck();
   }
   function propose(repo, s, message) {
     const a = { ...s, message, snoozeText: snoozeLabel(cooldownSeconds), id: crypto.randomUUID() }, f = `approval-${a.id}.json`;
@@ -589,7 +595,12 @@ export function startMonitor(config = {}, notify) {
     }
     if (!adopted) adoptOpenApprovals(entries);
     const seen = new Set(entries.map(x => x.repo));
-    for (const [repo, watcher] of watchers) if (!seen.has(repo) || (errors.length > 0 && !explicit.length)) { invalidate(repo); watcher.close(); watchers.delete(repo); tracker.items.delete(repo); }
+    // 这一轮没能解析出仓库路径（盘符忙、被杀毒软件锁住等），只是「没看到」，不等于「变了」。
+    // 作废确认必须有证据：真正的内容变化由轮询比对发现，提交前 commit() 还会再校验一次。
+    for (const [repo, watcher] of watchers) if (!seen.has(repo) || (errors.length > 0 && !explicit.length)) {
+      watcher.close(); watchers.delete(repo); tracker.items.delete(repo);
+      if (errors.length) console.error(`[跳过] ${repo} 本轮无法解析路径，确认保留：${errors.map(e => e.error).join('; ')}`);
+    }
     for (const entry of entries) {
       const repo = entry.repo, settings = entry.settings;
       try {
@@ -607,7 +618,7 @@ export function startMonitor(config = {}, notify) {
         // 内容没变、只是 git 刷新了索引（版本号变但内容相同）时，作废弹窗只会让人白点一次
         if (open.has(repo) && !sameContent(open.get(repo), s)) {
           const diff = contentDiff(open.get(repo), s);
-          invalidate(repo, diff.slice(0, 3).join('、') + (diff.length > 3 ? ` 等 ${diff.length} 个文件` : ''));
+          invalidate(repo, diff.slice(0, 3).join('、') + (diff.length > 3 ? ` 等 ${diff.length} 个文件` : ''), 'poll');
         }
         if (!watchers.has(repo)) {
           try {
@@ -621,7 +632,7 @@ export function startMonitor(config = {}, notify) {
               else if (/(^|\/)\.git(\/|$)/.test(n)) { /* .git 内部改动不算工作区改动 */ }
               else if (!excluded(repo, n)) watcherChanged(repo, n);
             });
-            w.on('error', () => { invalidate(repo); w.close(); watchers.delete(repo); tracker.items.delete(repo); }); watchers.set(repo, w);
+            w.on('error', (e) => { console.error(`[监听失效] ${repo}：${String(e && e.message || '')}（改用轮询，确认保留）`); w.close(); watchers.delete(repo); tracker.items.delete(repo); }); watchers.set(repo, w);
           } catch { tracker.items.delete(repo); continue; }
         }
         // 分支只认项目自己的设置（留空即跟随当前分支），没有全局默认分支这回事
@@ -665,7 +676,7 @@ export function startMonitor(config = {}, notify) {
           }
         }
       } catch (e) {
-        invalidate(repo); tracker.items.delete(repo);
+        tracker.items.delete(repo);
         // 同一个仓库的老问题反复刷屏没有意义，只在说法变化时记一次
         if (lastError.get(repo) !== e.message) { lastError.set(repo, e.message); console.error(`${repo}: ${e.message}`); }
       }
@@ -673,7 +684,7 @@ export function startMonitor(config = {}, notify) {
     if (errors.length) console.error(JSON.stringify(errors));
   }
   const stateWatcher = fs.watch(state, (event, name) => { if (/^run-.*\.json$/.test(String(name))) requestCheck(); });
-  stateWatcher.on('error', () => { for (const repo of tracker.items.keys()) invalidate(repo); tracker.items.clear(); });
+  stateWatcher.on('error', () => { tracker.items.clear(); });
   round(); timer = setInterval(round, (config.pollSeconds ?? 30) * 1000);
   return { tracker, check: round, close() { stopped = true; clearInterval(timer); clearTimeout(wake); stateWatcher.close(); for (const w of watchers.values()) w.close(); } };
 }

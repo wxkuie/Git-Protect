@@ -113,7 +113,12 @@ test('运行结束即时检查、事件变动撤销旧授权', async () => {
     m.tracker.items.get(snapshot(r).repo).since = Date.now() - 601000;
     marker(r, 'end', 'writer');
     let timeout; const result = await Promise.race([shown, new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('end 未触发即时检查')), 20000); })]); clearTimeout(timeout);
-    write(r, 'a.txt', 'temporary'); write(r, 'a.txt', 'ready'); await new Promise(resolve => setTimeout(resolve, 200));
+    // 同一个文件被重新写入、但内容一模一样：没变化就是没变化，确认必须继续有效。
+    // 老行为是「监听一响就作废」，写回相同内容也会误杀——这正是用户遇到的假失效。
+    write(r, 'a.txt', 'ready'); await new Promise(resolve => setTimeout(resolve, 900));
+    validate(result.a);
+    // 内容真的变了，才允许作废
+    write(r, 'a.txt', 'changed'); await new Promise(resolve => setTimeout(resolve, 900));
     assert.throws(() => validate(result.a), /旧确认失效/); result.done();
   } finally { m.close(); }
 });
