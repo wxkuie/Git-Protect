@@ -450,6 +450,8 @@
     return {
       // 模式、停手时长都是全局的：一个项目设一次纯属增加点击
       mode: el('mode').value,
+      // 自启勾选框也要带上：不带的话服务端只能用默认值 false 补，保存一次就把开机自启关掉
+      autoStart: !!el('autoStart').checked,
       idleSeconds: Math.round(Number(el('idleMinutes').value) * 60),
       projects: state.projects.map(function (p) {
         return { path: p.path, enabled: p.enabled, branch: p.branch };
@@ -535,12 +537,25 @@
     return parts[0] || String(value || '');
   }
 
+  // 阻断原因的处置入口：只提供「收尾运行标记」「清理残留索引锁」这两种明确动作
+  function blockerButton(repoPath, b) {
+    if (!b) return '';
+    if (b.kind === 'marker') return '<button class="small" data-endmarker="' + esc(repoPath) + '" data-token="' + esc(b.token || '') + '">收尾</button>';
+    if (b.kind === 'lock') return '<button class="small" data-clearlock="' + esc(repoPath) + '">清理 lock</button>';
+    return '';
+  }
+
   // 「为什么没提醒」：每个项目一行主原因，次要原因缩进跟在后面。
   // 数据来自 /api/projects 的 blockers（guard.stateBlockers + 快照状态），不在前端猜。
   function renderBlockers() {
     var box = el('blockList');
     var rows = state.server || [];
-    if (!rows.length) { box.innerHTML = '<li class="empty" style="border:none;padding:10px 0">还没有项目</li>'; return; }
+    if (!rows.length) {
+      // 首次打开时 /api/projects 还在跑快照，写「还没有项目」会让人以为配置丢了
+      var waiting = state.monitor && state.monitor.running;
+      box.innerHTML = '<li class="empty" style="border:none;padding:10px 0">' + (waiting ? '正在读取项目状态…' : '还没有项目') + '</li>';
+      return;
+    }
     var html = '';
     var running = state.monitor && state.monitor.running;
     if (!running) html += '<li><span class="r">监视没有运行</span><span class="bad">所有项目都不会提醒；点右下角「开始监视」</span></li>';
@@ -554,14 +569,12 @@
       if (!main) main = list[0] || { kind: 'ready', text: '正常' };
       var cls = (main.kind === 'clean' || main.kind === 'ready') ? 'good' : (main.kind === 'waiting' ? 'm' : 'bad');
       html += '<li><span class="r" style="flex:0 0 96px">' + esc(shortRepo(row.path)) + '</span><span class="' + cls + '" style="flex:1">' + esc(main.text || main.short || '') + '</span>';
-      if (main.kind === 'marker') {
-        html += '<button class="small" data-endmarker="' + esc(row.path) + '" data-token="' + esc(main.token || '') + '">收尾</button>';
-      }
+      html += blockerButton(row.path, main);
       html += '</li>';
       list.forEach(function (b) {
         if (b === main) return;
         if (b.kind === 'clean' || b.kind === 'ready' || b.kind === 'waiting') return;
-        html += '<li><span class="r" style="flex:0 0 96px"></span><span class="m" style="flex:1">· ' + esc(b.text || b.short || '') + '</span></li>';
+        html += '<li><span class="r" style="flex:0 0 96px"></span><span class="m" style="flex:1">· ' + esc(b.text || b.short || '') + '</span>' + blockerButton(row.path, b) + '</li>';
       });
     });
     box.innerHTML = html;
@@ -583,6 +596,7 @@
       else if (kind === 'close') { text = '直接关闭了弹窗（进入冷却）' + (ev.count != null ? '，' + ev.count + ' 个文件未提交' : ''); }
       else if (kind === 'invalidate') { text = '确认失效' + (ev.detail ? '：' + ev.detail : ''); }
       else if (kind === 'recover') { text = '清理了提交收尾' + (ev.repaired && ev.repaired.length ? '（对齐 ' + ev.repaired.join('、') + '）' : ''); }
+      else if (kind === 'lock-clear') { cls = 'warn'; text = '清理了残留的 index.lock'; }
       else if (kind === 'marker-begin') { text = '开始运行标记 ' + (ev.token || ''); }
       else if (kind === 'marker-end') { text = '结束运行标记 ' + (ev.token || ''); }
       else if (kind === 'monitor-start') { cls = 'good'; text = '监视启动（' + (ev.projects || 0) + ' 个项目）'; }
@@ -792,8 +806,21 @@
   el('projList').addEventListener('input', onProjEdit);
   el('projList').addEventListener('change', onProjEdit);
 
-  // 活动页的「收尾」按钮：结束外部自动化留下的运行标记，不做别的状态改写
+  // 活动页按钮：收尾运行标记 / 清理残留索引锁（后者必须由人确认没有 git 在跑）
   el('blockList').addEventListener('click', async function (e) {
+    var lockBtn = e.target && e.target.closest ? e.target.closest('button[data-clearlock]') : null;
+    if (lockBtn) {
+      var lockRepo = lockBtn.getAttribute('data-clearlock');
+      var sure = window.confirm('确认此刻没有其它 git 操作在跑？\n\n将删除该仓库的 .git/index.lock。如果正好有 git 在写索引，删锁可能让那次操作写坏索引。');
+      if (!sure) return;
+      lockBtn.disabled = true;
+      try {
+        await api('/api/lock', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: lockRepo }) });
+        setMsg('索引锁已清理', 'ok');
+        await loadAll();
+      } catch (err) { lockBtn.disabled = false; setMsg('清理失败：' + err.message, 'err'); }
+      return;
+    }
     var btn = e.target && e.target.closest ? e.target.closest('button[data-endmarker]') : null;
     if (!btn) return;
     btn.disabled = true;

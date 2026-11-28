@@ -7,7 +7,7 @@ import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
-import { scan, recoveryReport, clearRecovery, useStateDir, readActivity, marker } from './guard.mjs';
+import { scan, recoveryReport, clearRecovery, useStateDir, readActivity, marker, clearIndexLock, pruneStateFiles } from './guard.mjs';
 // 状态行与分支列表在工作线程里算：同步 git 会卡住整个 HTTP 服务（实测单次重算 5 秒）
 import { projectRows, branchList as branchListSync, currentBranchOf } from './panel-facts.mjs';
 import { inspectPrereqs, pickGitAsset, pickPowerShellMsi, pickMirrorGitTag, mirrorGitAsset, downloadDir, GIT_RELEASES_API, PS_RELEASES_API, GIT_MIRROR_LISTING } from './prereq.mjs';
@@ -447,7 +447,12 @@ const server = http.createServer(async function (req, res) {
     }
     if (req.method === 'POST' && url.pathname === '/api/config') {
       const body = await readBody(req);
-      const config = validate(body.config || body);
+      const incoming = body.config || body;
+      const previous = readConfig();
+      const config = validate(incoming);
+      // 界面只负责它自己管理的字段；请求里没带 autoStart 时保留原值。
+      // 否则「开着开机自启、改完停手分钟数点保存」会把它悄悄改回 false（0.8.20 修）。
+      if (incoming && typeof incoming === 'object' && incoming.autoStart === undefined) config.autoStart = !!(previous && previous.autoStart);
       writeConfig(config);
       const wasRunning = monitorRunning();
       const monitor = wasRunning ? await restartMonitor() : monitorStatus();
@@ -461,6 +466,17 @@ const server = http.createServer(async function (req, res) {
       const result = body.clear ? clearRecovery(target) : recoveryReport(target);
       rowsCache.stamp = '';
       send(res, 200, result);
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/lock') {
+      // 清理残留的 .git/index.lock。界面负责二次确认「确实没有 git 操作在跑」，
+      // 服务端不猜测：给了明确请求就删，删完记一条活动记录。
+      const body = await readBody(req);
+      const target = normalizePath(body.path);
+      if (!target) throw fail('缺少项目路径', 400);
+      const result = clearIndexLock(target);
+      rowsCache.stamp = '';
+      send(res, 200, Object.assign({ ok: true, path: target }, result));
       return;
     }
     if (req.method === 'POST' && url.pathname === '/api/marker') {
@@ -690,6 +706,8 @@ export async function startPanel(options) {
   // 面板自己调 guard 的那些函数（恢复诊断、状态行）必须和监视器用同一个状态目录，
   // 否则打包版面板读的是安装目录 .state，监视器写的是 %APPDATA%，界面上看不到也清不掉门禁。
   useStateDir(stateDir);
+  // 状态目录里的失败记录/冷却记录会一直累积：面板每次启动清一次过期的（默认 30 天）
+  try { pruneStateFiles(30); } catch (e) {}
   const basePort = Number.isFinite(opts.port) ? opts.port : 7331;
   if (!Number.isFinite(basePort) || basePort < 0 || basePort > 65000) throw new Error('无效端口');
   let port = null;

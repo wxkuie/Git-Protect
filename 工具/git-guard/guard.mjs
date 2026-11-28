@@ -93,6 +93,12 @@ function activityPath() { return path.join(state, 'activity.jsonl'); }
 export function appendActivity(event) {
   try {
     fs.mkdirSync(state, { recursive: true });
+    // 升级、改配置、崩溃重开都会重启监视：10 分钟内重复的「监视启动」不再记，
+    // 否则活动页第一屏全是这一条，用户真正要找的记录被挤下去。
+    if (event && event.kind === 'monitor-start') {
+      const last = readActivity(1)[0];
+      if (last && last.kind === 'monitor-start' && Date.now() - Date.parse(last.time) < 600000) return;
+    }
     fs.appendFileSync(activityPath(), JSON.stringify({ time: new Date().toISOString(), ...event }) + '\n', 'utf8');
   } catch (e) {}
 }
@@ -145,7 +151,40 @@ export function stateBlockers(repo, view, options = {}) {
       if (now < until) out.push({ kind: 'cooldown', until: until, short: '冷却中', text: '提醒窗口关过了，' + fmtWhen(until) + ' 之后才会再提醒' });
     }
   }
+  // 提交被打断会留下 .git/index.lock，之后所有 git 操作都被挡住；超过 1 分钟才提示，
+  // 正常 git 操作只会持有几毫秒，不该闪一下就说「残留」。
+  try {
+    const lockPath = repoSkeleton(repo).index + '.lock';
+    const ageMs = now - fs.statSync(lockPath).mtimeMs;
+    if (ageMs > 60000) out.push({ kind: 'lock', path: lockPath, ageMs: ageMs, short: '索引锁未清理', text: '残留的 index.lock（' + Math.round(ageMs / 60000) + ' 分钟前），确认没有其它 git 操作后可以清理' });
+  } catch (e) {}
   return out;
+}
+
+// 状态目录只增不减会越积越多：清掉早就没用的记录（默认 30 天）。
+// 只清「明确过期」的诊断/冷却类文件；事务、恢复、审批、窗口这些还可能有用的，一律不碰。
+export function pruneStateFiles(days = 30) {
+  const cutoff = Date.now() - Math.max(1, Number(days) || 30) * 86400000, removed = [];
+  let names = [];
+  try { names = fs.readdirSync(state); } catch (e) { return { removed: removed }; }
+  for (const name of names) {
+    if (!/^(invalid|attempt|result|cooldown|skip|snooze)-/.test(name)) continue;
+    const file = path.join(state, name);
+    try { if (fs.statSync(file).mtimeMs < cutoff) { fs.unlinkSync(file); removed.push(name); } } catch (e) {}
+  }
+  return { removed: removed };
+}
+
+// 清理「明确的索引锁文件」。调用方必须先让用户确认此刻没有别的 git 操作在跑，
+// 因为删掉正在使用的锁会让那次 git 操作写坏索引。
+export function clearIndexLock(repo) {
+  const target = canonical(repo);
+  const lockPath = repoSkeleton(target).index + '.lock';
+  let removed = false;
+  try { fs.unlinkSync(lockPath); removed = true; }
+  catch (e) { if (e.code !== 'ENOENT') throw new Error('删除索引锁失败：' + e.message); }
+  if (removed) appendActivity({ kind: 'lock-clear', repo: target, path: lockPath });
+  return { repo: target, path: lockPath, removed: removed };
 }
 // 钩子不能缓存：core.hooksPath 和钩子文件都可能在同一进程内被改动（测试和用户都会这么干），
 // 缓存会让「装了 pre-commit 却没被拦住」这种安全判断失真。
@@ -233,14 +272,33 @@ export function snapshot(repo, selected) {
   const stageEntries = listed.map(x => x.slice(2));
   const trackedPaths = stageEntries.map(x => x.slice(x.indexOf('\t') + 1));
   const changes = []; const reasons = [], nestedWorktrees = [];
+  // 忽略目录只对「未跟踪」的文件生效：仓库里已经跟踪的 dist/build 产物是用户的真实内容，
+  // 静默丢掉会让这些改动既不提醒、也永远提交不了（0.8.20 修）。
+  const trackedSet = new Set(trackedPaths);
+  const ignored = function (name) { return !trackedSet.has(name) && excluded(repo, name); };
   for (let i = 0; i < entries.length; i++) {
     const item = entries[i]; if (!item) continue;
     const code = item.slice(0, 2), name = item.slice(3);
-    if (/[RC]/.test(code)) { const from = entries[++i]; if (!excluded(repo, name) || !excluded(repo, from)) { reasons.push('重命名或复制状态暂不支持'); changes.push({ code, path: name, from, hash: fileHash(repo, name) }); } continue; }
-    if (excluded(repo, name)) continue;
+    if (/[RC]/.test(code)) { const from = entries[++i]; if (!ignored(name) || !ignored(from)) { reasons.push('重命名或复制状态暂不支持'); changes.push({ code, path: name, from, hash: fileHash(repo, name) }); } continue; }
+    if (ignored(name)) continue;
     if (code === '??' && isUntrackedWorktree(repo, name, trackedPaths)) { nestedWorktrees.push(name.slice(0, -1)); continue; }
     const hash = fileHash(repo, name); if (hash === 'unsupported') reasons.push(`不支持的文件类型：${name}`);
     changes.push({ code, path: name, hash });
+  }
+  // 同一路径可能同时出现两条：典型是 git rm --cached（索引里删掉、工作区变成未跟踪）。
+  // 合并成一条，否则批准范围重复，validate 会永远报「提交范围为空、重复」把仓库卡死。
+  const merged = new Map();
+  for (const item of changes) {
+    const prev = merged.get(item.path);
+    if (!prev) { merged.set(item.path, item); continue; }
+    // 留「工作区还有内容」的那条（?? / M），它才是真正要提交的内容；纯删除状态会误导人
+    if (prev.code === 'D ' && item.code !== 'D ') merged.set(item.path, item);
+  }
+  if (merged.size !== changes.length) {
+    changes.length = 0; changes.push(...merged.values());
+    // 这类状态含糊：索引里已删、工作区还留着。工具不能替用户决定「恢复跟踪」还是「彻底移除」，
+    // 但必须把话说清楚，否则用户只会看到看不懂的「提交范围…重复」。
+    reasons.push('同一路径既被从索引删除、又还留在工作区（git rm --cached 后常见）：请先手工决定 git add 恢复跟踪，还是提交这个删除');
   }
   const paths = selected || changes.map(x => x.path);
   if (!Array.isArray(paths)) throw new Error('提交范围必须是文件路径数组');
@@ -294,8 +352,19 @@ export function recoveryReport(repo) {
     report.reason = report.runLock ? '没有未收尾的事务，只剩一个空的运行锁，可以清理' : '没有未收尾的事务，无需处理';
     return report;
   }
-  const indexLock = path.join(repo, '.git', 'index.lock');
-  if (fs.existsSync(indexLock)) { report.reason = '检测到 index.lock，说明此刻有提交正在进行；请先停止监视并确认没有 git 操作再试'; return report; }
+  // worktree / 拆分索引下真实索引不在 <repo>/.git/index，锁路径必须跟着索引走
+  let indexLock = path.join(repo, '.git', 'index.lock');
+  try { indexLock = repoSkeleton(repo).index + '.lock'; } catch (e) {}
+  if (fs.existsSync(indexLock)) {
+    let ageMs = 0;
+    try { ageMs = Date.now() - fs.statSync(indexLock).mtimeMs; } catch (e) {}
+    report.indexLock = indexLock;
+    report.indexLockStale = ageMs > 60000;
+    report.reason = report.indexLockStale
+      ? '检测到 ' + Math.round(ageMs / 60000) + ' 分钟前的 index.lock（多半是提交被打断留下的）；确认没有其它 git 操作后，可在「活动」页点清理'
+      : '检测到 index.lock，说明此刻有提交正在进行；请先停止监视并确认没有 git 操作再试';
+    return report;
+  }
   let head = '';
   try { head = git(repo, ['rev-parse', '--verify', 'HEAD^{commit}']); } catch (e) { head = ''; }
   if (transaction.commit) {
@@ -511,6 +580,13 @@ export function commit(approval) {
     const records = selectedIndexRecords(repo, workIndex, approval.paths);
     if (records.length) git(repo, ['update-index', '-z', '--index-info'], { env: { GIT_INDEX_FILE: nextIndex }, input: records });
     const expectedTree = git(repo, ['write-tree'], { env: { GIT_INDEX_FILE: workIndex } });
+    // 加回去的内容和现有提交完全一样时，git commit 会以「没有可提交的内容」失败；
+    // 而事务门禁在这行之前就落盘了，失败后会永久挡住这个仓库。提前判定成普通拒绝。
+    if (before.head) {
+      let headTree = '';
+      try { headTree = git(repo, ['rev-parse', before.head + '^{tree}']); } catch (e) { headTree = ''; }
+      if (headTree && headTree === expectedTree) throw new Error('这些改动与已提交内容一致，没有需要提交的内容（可能只是索引状态变化，请手工确认）');
+    }
     fs.copyFileSync(nextIndex, lock);
     const prepared = fs.openSync(lock, 'r+'); try { fs.fsyncSync(prepared); } finally { fs.closeSync(prepared); }
     preflightIndex(index);
@@ -539,7 +615,10 @@ export function commit(approval) {
     catch (e) { throw new Error(`提交 ${id} 已创建，但索引更新失败：${e.message}；未自动回退`); }
     const result = { repo, commit: id, paths: approval.paths, time: new Date().toISOString() }; save(attempt, { status: 'completed', ...result }); save(`result-${repoKey(repo)}.json`, result);
     appendActivity({ kind: 'commit', repo, commit: id, count: approval.paths.length, message: approval.message, approvalId: approval.id || null });
-    fs.unlinkSync(transactionFile); transactionOwned = false; preserve = false; return result;
+    fs.unlinkSync(transactionFile); transactionOwned = false; preserve = false;
+    // 提交成功、事务也已删除，attempt 只剩「万一崩溃」的诊断价值；留着会一提交一条越积越多
+    try { fs.unlinkSync(path.join(state, attempt)); } catch (e) {}
+    return result;
   } catch (e) {
     if (commitCreated) {
       preserve = true;
@@ -641,6 +720,7 @@ export function startMonitor(config = {}, notify) {
     }
   }
   fs.mkdirSync(state, { recursive: true });
+  pruneStateFiles(30);
   appendActivity({ kind: 'monitor-start', projects: (Array.isArray(config.projects) ? config.projects.filter(p => p && p.enabled !== false).length : 0) });
   const cooldownSeconds = config.cooldownSeconds ?? 7200;
   const tracker = new Tracker((config.idleSeconds ?? 600) * 1000, cooldownSeconds * 1000), watchers = new Map(), open = new Map();
@@ -710,6 +790,8 @@ export function startMonitor(config = {}, notify) {
     // 窗口已经结束，这份审批文件再没有使用方；不删就会在状态目录里越积越多。
     try { fs.unlinkSync(path.join(state, `window-${a.id}.json`)); } catch (e) {}
     try { fs.unlinkSync(path.join(state, `approval-${a.id}.json`)); } catch (e) {}
+    // 「确认失效」记录只服务于这一次弹窗；弹窗收尾后它就是垃圾
+    try { fs.unlinkSync(path.join(state, `invalid-${a.id}.json`)); } catch (e) {}
     const item = tracker.items.get(repo);
     // 用当前观测到的版本记拒绝：弹窗打开期间索引可能刷新过，用旧版本记不上冷却。
     const version = item && item.version ? item.version : a.version;

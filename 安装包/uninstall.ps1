@@ -1,4 +1,4 @@
-﻿# 卸载 Git 静默提交助手（当前用户）
+# 卸载 Git 静默提交助手（当前用户）
 param([switch]$KeepConfig, [switch]$Silent)
 $ErrorActionPreference = 'Continue'
 
@@ -28,6 +28,8 @@ foreach ($name in @('Git 静默提交助手.lnk', '卸载 Git 静默提交助手
 $desktop = [Environment]::GetFolderPath('Desktop')
 Remove-Item (Join-Path $desktop 'Git 静默提交助手.lnk') -ErrorAction SilentlyContinue
 Remove-Item 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\GitQuietHelper' -Recurse -ErrorAction SilentlyContinue
+# 开机自启项：Electron 用 appUserModelId 作值名。不清掉的话，卸载后每次登录还会去启动已删除的程序。
+Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'electron.app.GitQuietHelper' -ErrorAction SilentlyContinue
 
 # 从安装目录里删掉自己：先切到临时目录，否则目录被占用删不掉
 Set-Location $env:TEMP

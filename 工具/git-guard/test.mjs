@@ -12,7 +12,7 @@ const base = fs.mkdtempSync(path.resolve('.tmp/git-guard-tests-'));
 process.env.GIT_GUARD_STATE = path.join(base, 'state');
 process.env.GIT_CONFIG_GLOBAL = process.platform === 'win32' ? 'NUL' : '/dev/null';
 process.env.GIT_CONFIG_NOSYSTEM = '1';
-const { snapshot, commit, scan, marker, busy, Tracker, createApproval, validate, startMonitor, defaultMessage, sameContent, contentDiff, recoveryReport, clearRecovery, useStateDir, stateBlockers, readActivity } = await import('./guard.mjs');
+const { snapshot, commit, scan, marker, busy, Tracker, createApproval, validate, startMonitor, defaultMessage, sameContent, contentDiff, recoveryReport, clearRecovery, useStateDir, stateBlockers, readActivity, pruneStateFiles, clearIndexLock, appendActivity } = await import('./guard.mjs');
 const { inspectPrereqs, pickGitAsset, pickPowerShellMsi, pickMirrorGitTag, mirrorGitAsset } = await import('./prereq.mjs');
 let number = 0;
 function run(cwd, cmd, args, extra = {}) { const p = spawnSync(cmd, args, { cwd, encoding: 'utf8', env: { ...process.env, ...extra }, windowsHide: true, timeout: 45000 }); if (p.status !== 0) throw new Error(`${cmd}: ${p.error?.message || p.stderr || p.stdout}`); return p.stdout.trim(); }
@@ -938,4 +938,130 @@ test('面板活动接口能收尾运行标记并给出活动记录', async () =>
     panel.stop();
     useStateDir(original);
   }
+});
+
+test('已跟踪的 dist 改动照常提醒，未跟踪的 dist 仍按忽略目录处理', () => {
+  const r = fixture();
+  fs.mkdirSync(path.join(r, 'dist'), { recursive: true });
+  write(r, 'dist/bundle.js', 'v1\n');
+  git(r, 'add', '.'); git(r, 'commit', '-qm', 'track dist');
+  write(r, 'dist/bundle.js', 'v2\n');
+  const seen = snapshot(r);
+  assert.deepEqual(seen.changes.map(c => c.path), ['dist/bundle.js'], '已跟踪的 dist 改动必须出现在改动列表里');
+  assert.equal(seen.reasons.length, 0);
+  const done = commit(approve(r));
+  assert.equal(git(r, 'show', 'HEAD:dist/bundle.js'), 'v2', '提交内容要包含 dist 改动');
+  assert.match(done.commit, /^[0-9a-f]{40,64}$/);
+  // 没被跟踪的 dist 文件仍受忽略目录约束，不该被算进改动
+  write(r, 'dist/other.js', 'x\n');
+  assert.equal(snapshot(r).changes.some(c => c.path === 'dist/other.js'), false, '未跟踪的 dist 仍忽略');
+});
+
+test('同一路径既删除又未跟踪时给出可读原因，且不留下事务门禁', () => {
+  const r = fixture();
+  // 加 .gitignore 后 git rm --cached 的典型结果：索引里删除 + 工作区变成未跟踪
+  git(r, 'rm', '--cached', 'a.txt');
+  const seen = snapshot(r);
+  assert.equal(seen.changes.length, 1, '同一路径要合并成一条');
+  assert.equal(seen.reasons.some(x => x.includes('提交范围为空、重复')), false, '不该再报晦涩的「提交范围…重复」');
+  assert.ok(seen.reasons.some(x => x.includes('git rm --cached')), '要说清这是需要人工决定的索引状态');
+  // 空提交保护：提交前就该拒绝，而不是让 git 失败后留下永久门禁
+  assert.throws(() => commit(approve(r)), /git rm --cached/);
+  // 只看这个仓库自己的事务：状态目录是共享的，别的用例会故意留下门禁做验证
+  const ownTransaction = path.join(process.env.GIT_GUARD_STATE, 'transaction-' + digest(seen.repo) + '.json');
+  assert.equal(fs.existsSync(ownTransaction), false, '不能给这个仓库留下事务门禁');
+  assert.equal(fs.existsSync(path.join(r, '.git', 'index.lock')), false, '不能留下索引锁');
+  assert.equal(git(r, 'show', 'HEAD:a.txt'), 'base', 'HEAD 不能被改动');
+  assert.equal(git(r, 'status', '--porcelain').split('\n').length, 2, '工作区状态保持原样');
+});
+
+test('提交成功后不留下 attempt 残留', () => {
+  const r = fixture(); write(r, 'a.txt', 'no leftovers');
+  const state = process.env.GIT_GUARD_STATE;
+  const count = () => fs.readdirSync(state).filter(n => n.startsWith('attempt-')).length;
+  const before = count();
+  commit(approve(r));
+  assert.equal(count(), before, '成功提交后 attempt 文件要删掉，不能一提交一条地攒着');
+});
+
+test('状态目录里过期的失败记录会被清剪，新记录保留', () => {
+  const state = process.env.GIT_GUARD_STATE;
+  fs.mkdirSync(state, { recursive: true });   // 单跑这条时状态目录还没被别的用例建出来
+  const oldFile = path.join(state, 'invalid-prune-old.json');
+  const newFile = path.join(state, 'invalid-prune-new.json');
+  fs.writeFileSync(oldFile, '{}'); fs.writeFileSync(newFile, '{}');
+  const past = new Date(Date.now() - 40 * 86400000);
+  fs.utimesSync(oldFile, past, past);
+  const result = pruneStateFiles(30);
+  assert.ok(result.removed.includes('invalid-prune-old.json'), '40 天前的记录该清掉');
+  assert.equal(fs.existsSync(oldFile), false);
+  assert.equal(fs.existsSync(newFile), true, '新记录不能被误删');
+  fs.unlinkSync(newFile);
+});
+
+test('残留的索引锁能被识别并清理', () => {
+  const r = fixture(); write(r, 'a.txt', 'locked');
+  const view = snapshot(r);
+  assert.equal(stateBlockers(r, view, {}).some(b => b.kind === 'lock'), false, '没有锁时不该提示');
+  const lockPath = path.join(r, '.git', 'index.lock');
+  fs.writeFileSync(lockPath, '');
+  // 刚创建的锁多半是正常 git 操作，不该立刻喊残留
+  assert.equal(stateBlockers(r, view, {}).some(b => b.kind === 'lock'), false, '1 分钟内的锁不提示');
+  const old = new Date(Date.now() - 5 * 60000); fs.utimesSync(lockPath, old, old);
+  const blocker = stateBlockers(r, view, {}).find(b => b.kind === 'lock');
+  assert.ok(blocker, '超过 1 分钟的锁要作为阻断原因');
+  assert.equal(path.resolve(blocker.path).toLowerCase(), path.resolve(lockPath).toLowerCase(), '要给出真实锁路径');
+  assert.equal(clearIndexLock(r).removed, true);
+  assert.equal(fs.existsSync(lockPath), false, '清理后锁文件要消失');
+  assert.ok(readActivity(50).some(e => e.kind === 'lock-clear'), '清理动作要写活动记录');
+  assert.equal(clearIndexLock(r).removed, false, '没有锁时返回未删除而不是报错');
+});
+
+test('保存配置时没带 autoStart 不会把开机自启关掉', async () => {
+  const { startPanel } = await import('./panel.mjs');
+  const original = process.env.GIT_GUARD_STATE;
+  try {
+    const dir = fs.mkdtempSync(path.join(base, 'panel-autostart-'));
+    fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({
+      mode: 'remind', idleSeconds: 600, pollSeconds: 30, cooldownSeconds: 7200, autoStart: true, projects: []
+    }));
+    const calls = [];
+    const panel = await startPanel({
+      port: 0, dataDir: dir, autoStartMonitor: false,
+      setAutoStart: async (on) => { calls.push(on); return { openAtLogin: on }; }
+    });
+    try {
+      assert.deepEqual(calls, [true], '启动时按配置对齐一次');
+      // 界面保存只提交它自己管的字段，没带 autoStart
+      const res = await fetch(panel.url + 'api/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config: { mode: 'remind', idleSeconds: 900, pollSeconds: 30, cooldownSeconds: 7200, projects: [] } })
+      });
+      assert.equal(res.status, 200);
+      const applied = await res.json();
+      assert.equal(applied.config.autoStart, true, '响应里也要保留原值');
+      const saved = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'));
+      assert.equal(saved.autoStart, true, '落盘配置不能把开机自启改回 false');
+      assert.equal(saved.idleSeconds, 900, '本次修改的字段要生效');
+      assert.deepEqual(calls, [true], '保存配置不该顺手改自启动');
+      // 明确传 false 时仍然要能关掉
+      const off = await fetch(panel.url + 'api/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config: { mode: 'remind', idleSeconds: 900, pollSeconds: 30, cooldownSeconds: 7200, autoStart: false, projects: [] } })
+      });
+      assert.equal((await off.json()).config.autoStart, false);
+    } finally { panel.stop(); }
+  } finally { useStateDir(original); }
+});
+
+test('连续重启不会把「监视启动」刷满活动页', () => {
+  const starts = () => readActivity(500).filter(e => e.kind === 'monitor-start').length;
+  appendActivity({ kind: 'monitor-stop' });          // 先断开，避免受前面用例影响
+  const before = starts();
+  appendActivity({ kind: 'monitor-start', projects: 3 });
+  appendActivity({ kind: 'monitor-start', projects: 3 });
+  assert.equal(starts(), before + 1, '10 分钟内重复的启动只记一条');
+  appendActivity({ kind: 'monitor-stop' });
+  appendActivity({ kind: 'monitor-start', projects: 3 });
+  assert.equal(starts(), before + 2, '中间隔了停止事件仍要单独记');
 });

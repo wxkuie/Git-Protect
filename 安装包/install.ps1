@@ -96,7 +96,10 @@ Set-ItemProperty -Path $key -Name 'DisplayVersion' -Value $version
 Set-ItemProperty -Path $key -Name 'Publisher' -Value '本地工具'
 Set-ItemProperty -Path $key -Name 'InstallLocation' -Value $Target
 Set-ItemProperty -Path $key -Name 'DisplayIcon' -Value $installedExe
-Set-ItemProperty -Path $key -Name 'UninstallString' -Value ('pwsh -NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $Target 'uninstall.ps1') + '"')
+# 卸载命令不能写死 pwsh：只有 PowerShell 5.1 的机器也能装（安装脚本只警告不拦），
+# 写死 pwsh 会让这些机器在「应用和功能」里点卸载毫无反应。
+$psHost = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell.exe' }
+Set-ItemProperty -Path $key -Name 'UninstallString' -Value ($psHost + ' -NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $Target 'uninstall.ps1') + '"')
 Set-ItemProperty -Path $key -Name 'NoModify' -Value 1 -Type DWord
 Set-ItemProperty -Path $key -Name 'NoRepair' -Value 1 -Type DWord
 Set-ItemProperty -Path $key -Name 'EstimatedSize' -Value ([int]((Get-ChildItem $Target -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1KB)) -Type DWord
