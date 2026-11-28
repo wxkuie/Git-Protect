@@ -524,9 +524,15 @@
     return two(d.getMonth() + 1) + '-' + two(d.getDate()) + ' ' + two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds());
   }
 
+  // 项目很多都叫 1、2、3（D:/project/1），只取最后一段会分不清；带上父目录更可读
   function shortRepo(value) {
-    var parts = String(value || '').replace(/\\/g, '/').split('/');
-    return parts[parts.length - 1] || String(value || '');
+    var parts = String(value || '').replace(/\\/g, '/').split('/').filter(Boolean);
+    if (parts.length >= 2) {
+      var last = parts[parts.length - 1], parent = parts[parts.length - 2];
+      if (/^[A-Za-z]:$/.test(parent)) return last;
+      return parent + '/' + last;
+    }
+    return parts[0] || String(value || '');
   }
 
   // 「为什么没提醒」：每个项目一行主原因，次要原因缩进跟在后面。
@@ -547,7 +553,7 @@
       }
       if (!main) main = list[0] || { kind: 'ready', text: '正常' };
       var cls = (main.kind === 'clean' || main.kind === 'ready') ? 'good' : (main.kind === 'waiting' ? 'm' : 'bad');
-      html += '<li><span class="r" style="flex:0 0 92px">' + esc(shortRepo(row.path)) + '</span><span class="' + cls + '" style="flex:1">' + esc(main.text || main.short || '') + '</span>';
+      html += '<li><span class="r" style="flex:0 0 96px">' + esc(shortRepo(row.path)) + '</span><span class="' + cls + '" style="flex:1">' + esc(main.text || main.short || '') + '</span>';
       if (main.kind === 'marker') {
         html += '<button class="small" data-endmarker="' + esc(row.path) + '" data-token="' + esc(main.token || '') + '">收尾</button>';
       }
@@ -555,7 +561,7 @@
       list.forEach(function (b) {
         if (b === main) return;
         if (b.kind === 'clean' || b.kind === 'ready' || b.kind === 'waiting') return;
-        html += '<li><span class="r" style="flex:0 0 92px"></span><span class="m" style="flex:1">· ' + esc(b.text || b.short || '') + '</span></li>';
+        html += '<li><span class="r" style="flex:0 0 96px"></span><span class="m" style="flex:1">· ' + esc(b.text || b.short || '') + '</span></li>';
       });
     });
     box.innerHTML = html;
@@ -584,7 +590,7 @@
       else if (kind === 'auto-cap') { cls = 'warn'; text = '改动太多（' + ev.count + ' 个文件），超过自动提交上限，改为弹窗'; }
       else if (kind === 'auto-fail') { cls = 'bad'; text = '自动提交失败：' + (ev.detail || ''); }
       else { text = kind + (ev.detail ? '：' + ev.detail : ''); }
-      return '<li><span class="t">' + esc(when) + '</span><span class="r">' + esc(name) + '</span><span class="' + cls + '">' + esc(text) + '</span></li>';
+      return '<li><span class="t">' + esc(when) + '</span><span class="r" style="flex:0 0 96px">' + esc(name) + '</span><span class="' + cls + '" style="flex:1">' + esc(text) + '</span></li>';
     }).join('');
   }
 
