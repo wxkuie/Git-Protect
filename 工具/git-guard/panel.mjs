@@ -7,7 +7,7 @@ import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
-import { scan, recoveryReport, clearRecovery, useStateDir } from './guard.mjs';
+import { scan, recoveryReport, clearRecovery, useStateDir, readActivity, marker } from './guard.mjs';
 // 状态行与分支列表在工作线程里算：同步 git 会卡住整个 HTTP 服务（实测单次重算 5 秒）
 import { projectRows, branchList as branchListSync, currentBranchOf } from './panel-facts.mjs';
 import { inspectPrereqs, pickGitAsset, pickPowerShellMsi, pickMirrorGitTag, mirrorGitAsset, downloadDir, GIT_RELEASES_API, PS_RELEASES_API, GIT_MIRROR_LISTING } from './prereq.mjs';
@@ -424,7 +424,9 @@ const server = http.createServer(async function (req, res) {
         embedded: !!process.versions.electron,
         autoStartSupported: !!autoStartHook,
         monitor: monitorStatus(),
-        autoCommits: recentAutoCommits(20)
+        autoCommits: recentAutoCommits(20),
+        // 「活动」页：最近发生了什么（提交/弹窗/跳过/稍后/作废/运行标记/失败），新的在前
+        activity: readActivity(200)
       });
       return;
     }
@@ -459,6 +461,18 @@ const server = http.createServer(async function (req, res) {
       const result = body.clear ? clearRecovery(target) : recoveryReport(target);
       rowsCache.stamp = '';
       send(res, 200, result);
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/marker') {
+      // 运行标记（外部自动化 begin 过、却一直没 end）会静默挡住这个仓库的全部提醒。
+      // 界面只提供「收尾」动作：结束指定 token，不做其它状态改写。
+      const body = await readBody(req);
+      const target = normalizePath(body.path);
+      if (!target) throw fail('缺少项目路径', 400);
+      if (typeof body.token !== 'string' || !body.token) throw fail('缺少运行标记 token', 400);
+      const result = marker(target, 'end', body.token);
+      rowsCache.stamp = '';
+      send(res, 200, Object.assign({ ok: true, path: target }, result));
       return;
     }
     if (req.method === 'POST' && url.pathname === '/api/autostart') {

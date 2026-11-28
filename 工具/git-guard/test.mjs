@@ -12,7 +12,7 @@ const base = fs.mkdtempSync(path.resolve('.tmp/git-guard-tests-'));
 process.env.GIT_GUARD_STATE = path.join(base, 'state');
 process.env.GIT_CONFIG_GLOBAL = process.platform === 'win32' ? 'NUL' : '/dev/null';
 process.env.GIT_CONFIG_NOSYSTEM = '1';
-const { snapshot, commit, scan, marker, busy, Tracker, createApproval, validate, startMonitor, defaultMessage, sameContent, contentDiff, recoveryReport, clearRecovery, useStateDir } = await import('./guard.mjs');
+const { snapshot, commit, scan, marker, busy, Tracker, createApproval, validate, startMonitor, defaultMessage, sameContent, contentDiff, recoveryReport, clearRecovery, useStateDir, stateBlockers, readActivity } = await import('./guard.mjs');
 const { inspectPrereqs, pickGitAsset, pickPowerShellMsi, pickMirrorGitTag, mirrorGitAsset } = await import('./prereq.mjs');
 let number = 0;
 function run(cwd, cmd, args, extra = {}) { const p = spawnSync(cmd, args, { cwd, encoding: 'utf8', env: { ...process.env, ...extra }, windowsHide: true, timeout: 45000 }); if (p.status !== 0) throw new Error(`${cmd}: ${p.error?.message || p.stderr || p.stdout}`); return p.stdout.trim(); }
@@ -867,4 +867,75 @@ test('安装脚本拒绝删除已有非安装目录并拒绝源=目标', () => {
   const second = spawnRaw(src, 'pwsh', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(src, 'install.ps1'), '-Target', src, '-NoLaunch']);
   assert.notEqual(second.status, 0, '源目录不能当安装目标');
   assert.ok(fs.existsSync(path.join(src, 'GitQuietHelper.exe')), '安装包自身不能被删');
+});
+
+test('提交、运行标记与清理都会写进活动日志', () => {
+  const r = fixture(); write(r, 'a.txt', 'activity');
+  const a = approve(r); const c = commit(a);
+  marker(r, 'begin', 'activity-token'); marker(r, 'end', 'activity-token');
+  const events = readActivity(500);
+  assert.ok(events.some(e => e.kind === 'commit' && e.commit === c.commit && e.repo === a.repo), '提交要留下活动记录');
+  assert.ok(events.some(e => e.kind === 'marker-begin' && e.token === 'activity-token'), 'begin 要留下记录');
+  assert.ok(events.some(e => e.kind === 'marker-end' && e.token === 'activity-token' && e.repo === a.repo), 'end 要留下记录');
+});
+
+test('阻断原因说清运行标记、残留判定与稍后提醒', () => {
+  const r = fixture(); write(r, 'a.txt', 'blockers');
+  const view = snapshot(r);
+  const runFile = path.join(process.env.GIT_GUARD_STATE, 'run-' + digest(view.repo) + '.json');
+  marker(r, 'begin', 'stale-token');
+  let blockers = stateBlockers(r, view, { cooldownSeconds: 7200 });
+  const first = blockers.find(b => b.kind === 'marker');
+  assert.ok(first, '运行标记必须作为阻断原因出现');
+  assert.equal(first.token, 'stale-token');
+  assert.equal(first.stale, false, '刚开始的标记不该标成残留');
+  // 13 小时前的标记要能自己说出来，用户才知道该收尾而不是干等
+  fs.writeFileSync(runFile, JSON.stringify({ 'stale-token': { started: new Date(Date.now() - 13 * 3600 * 1000).toISOString() } }));
+  blockers = stateBlockers(r, snapshot(r), { cooldownSeconds: 7200 });
+  assert.equal(blockers.find(b => b.kind === 'marker').stale, true, '超过 12 小时应标为疑似残留');
+  marker(r, 'end', 'stale-token');
+  blockers = stateBlockers(r, snapshot(r), { cooldownSeconds: 7200 });
+  assert.equal(blockers.some(b => b.kind === 'marker'), false, '收尾后不再阻断');
+  const snoozeFile = path.join(process.env.GIT_GUARD_STATE, 'snooze-' + digest(view.repo) + '.json');
+  fs.writeFileSync(snoozeFile, JSON.stringify({ until: Date.now() + 3600000 }));
+  assert.ok(stateBlockers(r, snapshot(r), {}).some(b => b.kind === 'snooze'), '稍后提醒要出现在阻断原因里');
+  fs.unlinkSync(snoozeFile);
+});
+
+test('面板活动接口能收尾运行标记并给出活动记录', async () => {
+  const { startPanel } = await import('./panel.mjs');
+  const original = process.env.GIT_GUARD_STATE;
+  const root = fs.mkdtempSync(path.join(base, 'panel-activity-'));
+  const dataDir = path.join(root, 'data');
+  const stateDir = path.join(dataDir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const repo = fixture(); write(repo, 'a.txt', 'panel activity');
+  const real = path.normalize(fs.realpathSync.native(path.resolve(repo)));
+  const canonicalRepo = process.platform === 'win32' ? real.toLowerCase().replace(/^[a-z]:/, d => d.toUpperCase()) : real;
+  const runFile = path.join(stateDir, 'run-' + digest(canonicalRepo) + '.json');
+  fs.writeFileSync(runFile, JSON.stringify({ 'panel-token': { started: new Date().toISOString() } }));
+  fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify({
+    mode: 'remind', idleSeconds: 600, pollSeconds: 30, cooldownSeconds: 7200, autoStart: false,
+    projects: [{ path: repo, enabled: true, branch: '' }]
+  }));
+  const panel = await startPanel({ port: 0, dataDir: dataDir });
+  try {
+    const res = await fetch(panel.url + 'api/marker', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: repo, token: 'panel-token' })
+    });
+    const result = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(result.busy, false, '收尾后不该再忙');
+    assert.deepEqual(JSON.parse(fs.readFileSync(runFile, 'utf8')), {}, '标记要从状态文件里删掉');
+    const status = await (await fetch(panel.url + 'api/status')).json();
+    assert.ok((status.activity || []).some(e => e.kind === 'marker-end' && e.token === 'panel-token'), '面板状态要带出活动记录');
+    const projects = await (await fetch(panel.url + 'api/projects')).json();
+    const row = (projects.projects || []).find(p => path.resolve(p.path).toLowerCase() === path.resolve(repo).toLowerCase());
+    assert.ok(row, '面板要列出项目');
+    assert.equal((row.blockers || []).some(b => b.kind === 'marker'), false, '收尾后不该再有运行标记阻断');
+  } finally {
+    panel.stop();
+    useStateDir(original);
+  }
 });

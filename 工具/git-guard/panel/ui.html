@@ -37,7 +37,14 @@
   .body { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
   .pane { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 12px 14px 16px; }
   .pane[hidden] { display: none !important; }
-  .pane.logpane { display: flex; flex-direction: column; overflow: hidden; }
+  /* 「活动」页内容比原来的原始日志多，整页自己滚，列表不再各自截断 */
+  .pane.logpane { display: flex; flex-direction: column; overflow-y: auto; }
+  .logpane .evlist { max-height: none; }
+  .logpane pre.log { flex: 0 0 auto; max-height: 260px; }
+  .rawlog { margin-top: 12px; }
+  .rawlog summary { cursor: pointer; font-size: 12px; color: var(--muted); padding: 6px 0; }
+  .evlist .warn { color: #b45309; }
+  .evlist li button.small { margin-left: 8px; flex: 0 0 auto; }
   .panehead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
   .panehead .h { font-size: 12px; color: var(--muted); }
   .footer {
@@ -187,7 +194,7 @@
 <div class="app">
   <div class="tabs" id="tabs">
     <button data-tab="projects" class="active">项目</button>
-    <button data-tab="log">日志</button>
+    <button data-tab="log">活动</button>
     <span class="tspacer"></span>
     <span class="stat"><span class="sdot" id="sdot"></span><span id="sText">未运行</span></span>
   </div>
@@ -222,14 +229,18 @@
 
     <section class="pane logpane" data-pane="log" hidden>
       <div class="panehead">
-        <span class="h">自动提交记录</span>
+        <span class="h">现在为什么没提醒</span>
         <button class="small" id="logBtn">刷新</button>
       </div>
-      <ul class="evlist" id="evList"></ul>
-      <div class="panehead" style="margin-top:12px">
-        <span class="h">监视输出</span>
+      <ul class="evlist" id="blockList"></ul>
+      <div class="panehead" style="margin-top:14px">
+        <span class="h">最近活动</span>
       </div>
-      <pre class="log" id="log">（暂无日志）</pre>
+      <ul class="evlist" id="evList"></ul>
+      <details class="rawlog">
+        <summary>原始监视输出（排查用）</summary>
+        <pre class="log" id="log">（暂无日志）</pre>
+      </details>
     </section>
   </div>
 
@@ -289,7 +300,7 @@
 </div>
 
 <script>
-  var state = { dirty: false, monitor: null, projects: [], server: [], discovered: [], branches: {}, scanned: false, defaults: null, pickedRoot: '', selected: {}, lastEventTime: '' };
+  var state = { dirty: false, monitor: null, projects: [], server: [], discovered: [], branches: {}, scanned: false, defaults: null, pickedRoot: '', activity: [], selected: {}, lastEventTime: '' };
 
   function el(id) { return document.getElementById(id); }
   function esc(s) {
@@ -309,6 +320,8 @@
     if (!st) return '<span class="pill off">未检测</span>';
     if (st.gate) return '<span class="pill warn" title="上次提交做到一半中断了，需要先清理才能继续">提交未收尾</span>';
     if (st.error) return '<span class="pill warn">' + esc(st.error) + '</span>';
+    if (st.blockers && st.blockers.some(function (b) { return b.kind === 'marker'; })) return '<span class="pill warn" title="有外部自动化占着这个仓库，去「活动」页看原因或收尾">运行标记未结束</span>';
+    if (st.blockers && st.blockers.some(function (b) { return b.kind === 'recovery'; })) return '<span class="pill warn" title="提交恢复记录需要人工核对">需人工核对</span>';
     if (st.identityOk === false) return '<span class="pill warn" title="提交需要 git 用户名和邮箱">未配 git 身份</span>';
     if (st.branchOk === false) return '<span class="pill warn">分支不符</span>';
     if (st.changes > 0) return '<span class="pill warn">' + st.changes + ' 个待提交</span>';
@@ -449,7 +462,7 @@
     var failed = !m.running && m.lastExit && m.lastExit.code !== 0;
     el('sdot').className = 'sdot' + (m.running ? ' on' : (failed ? ' bad' : ''));
     el('sText').textContent = m.running ? '监视中' : (failed ? '监视异常退出' : '已停止');
-    el('sText').title = failed ? '看「日志」标签页里的原因' : '';
+    el('sText').title = failed ? '看「活动」标签页里的原因' : '';
     el('toggleMonitor').textContent = m.running ? '停止监视' : '开始监视';
     el('toggleMonitor').disabled = false;
   }
@@ -479,7 +492,8 @@
 
       var events = s.autoCommits || [];
       state.autoCommits = events;
-      renderEvents();
+      state.activity = s.activity || [];
+      renderActivity();
       var newest = events[0];
       if (newest && newest.time) {
         if (!state.lastEventTime) state.lastEventTime = newest.time;
@@ -496,6 +510,7 @@
       var r = await api('/api/projects');
       state.server = r.projects || [];
       if (!state.dirty) renderProjects();
+      renderBlockers();
     } catch (e) {}
   }
 
@@ -509,19 +524,67 @@
     return two(d.getMonth() + 1) + '-' + two(d.getDate()) + ' ' + two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds());
   }
 
-  function renderEvents() {
+  function shortRepo(value) {
+    var parts = String(value || '').replace(/\\/g, '/').split('/');
+    return parts[parts.length - 1] || String(value || '');
+  }
+
+  // 「为什么没提醒」：每个项目一行主原因，次要原因缩进跟在后面。
+  // 数据来自 /api/projects 的 blockers（guard.stateBlockers + 快照状态），不在前端猜。
+  function renderBlockers() {
+    var box = el('blockList');
+    var rows = state.server || [];
+    if (!rows.length) { box.innerHTML = '<li class="empty" style="border:none;padding:10px 0">还没有项目</li>'; return; }
+    var html = '';
+    var running = state.monitor && state.monitor.running;
+    if (!running) html += '<li><span class="r">监视没有运行</span><span class="bad">所有项目都不会提醒；点右下角「开始监视」</span></li>';
+    rows.forEach(function (row) {
+      var list = row.blockers || [];
+      var main = null;
+      for (var i = 0; i < list.length; i++) {
+        var b = list[i];
+        if (b.kind !== 'clean' && b.kind !== 'ready' && b.kind !== 'waiting') { main = b; break; }
+      }
+      if (!main) main = list[0] || { kind: 'ready', text: '正常' };
+      var cls = (main.kind === 'clean' || main.kind === 'ready') ? 'good' : (main.kind === 'waiting' ? 'm' : 'bad');
+      html += '<li><span class="r" style="flex:0 0 92px">' + esc(shortRepo(row.path)) + '</span><span class="' + cls + '" style="flex:1">' + esc(main.text || main.short || '') + '</span>';
+      if (main.kind === 'marker') {
+        html += '<button class="small" data-endmarker="' + esc(row.path) + '" data-token="' + esc(main.token || '') + '">收尾</button>';
+      }
+      html += '</li>';
+      list.forEach(function (b) {
+        if (b === main) return;
+        if (b.kind === 'clean' || b.kind === 'ready' || b.kind === 'waiting') return;
+        html += '<li><span class="r" style="flex:0 0 92px"></span><span class="m" style="flex:1">· ' + esc(b.text || b.short || '') + '</span></li>';
+      });
+    });
+    box.innerHTML = html;
+  }
+
+  // 「最近活动」：提交/弹窗/跳过/稍后/作废/运行标记/清理/失败，新的在前。
+  function renderActivity() {
     var box = el('evList');
-    var list = state.autoCommits || [];
-    if (!list.length) { box.innerHTML = '<li class="empty" style="border:none;padding:10px 0">还没有自动提交记录</li>'; return; }
-    box.innerHTML = list.map(function (ev) {
-      when = localStamp(ev.time);
-      var name = String(ev.repo || '').split(/[\\/]/).pop();
-      var modeText = ev.mode === 'notify' ? '自动' : (ev.mode === 'silent' ? '静默' : '提醒');
-      var result;
-      if (ev.error) result = '<span class="bad">失败：' + esc(String(ev.error).slice(0, 48)) + '</span>';
-      else if (ev.skipped) result = '<span class="bad">' + esc(ev.note || '已跳过') + '</span>';
-      else result = '<span class="good">已提交 ' + esc(String(ev.commit || '').slice(0, 7)) + '</span><span class="m"> · ' + (ev.count || 0) + ' 个文件</span>';
-      return '<li><span class="t">' + esc(when) + '</span><span class="r">' + esc(name) + '</span><span class="m">' + modeText + '</span>' + result + '</li>';
+    var list = state.activity || [];
+    if (!list.length) { box.innerHTML = '<li class="empty" style="border:none;padding:10px 0">还没有活动记录</li>'; return; }
+    box.innerHTML = list.slice(0, 120).map(function (ev) {
+      var when = localStamp(ev.time);
+      var name = ev.repo ? shortRepo(ev.repo) : '—';
+      var kind = ev.kind || 'event', cls = 'm', text;
+      if (kind === 'commit') { cls = 'good'; text = '已提交 ' + String(ev.commit || '').slice(0, 7) + (ev.count != null ? ' · ' + ev.count + ' 个文件' : ''); }
+      else if (kind === 'prompt') { cls = 'warn'; text = '弹窗提醒' + (ev.count != null ? '（' + ev.count + ' 个文件）' : ''); }
+      else if (kind === 'skip') { text = '选了「本次不提交」' + (ev.count != null ? '（' + ev.count + ' 个文件）' : ''); }
+      else if (kind === 'snooze') { text = '选了「稍后提醒」，' + localStamp(ev.until) + ' 前不打扰'; }
+      else if (kind === 'close') { text = '直接关闭了弹窗（进入冷却）' + (ev.count != null ? '，' + ev.count + ' 个文件未提交' : ''); }
+      else if (kind === 'invalidate') { text = '确认失效' + (ev.detail ? '：' + ev.detail : ''); }
+      else if (kind === 'recover') { text = '清理了提交收尾' + (ev.repaired && ev.repaired.length ? '（对齐 ' + ev.repaired.join('、') + '）' : ''); }
+      else if (kind === 'marker-begin') { text = '开始运行标记 ' + (ev.token || ''); }
+      else if (kind === 'marker-end') { text = '结束运行标记 ' + (ev.token || ''); }
+      else if (kind === 'monitor-start') { cls = 'good'; text = '监视启动（' + (ev.projects || 0) + ' 个项目）'; }
+      else if (kind === 'monitor-stop') { text = '监视停止'; }
+      else if (kind === 'auto-cap') { cls = 'warn'; text = '改动太多（' + ev.count + ' 个文件），超过自动提交上限，改为弹窗'; }
+      else if (kind === 'auto-fail') { cls = 'bad'; text = '自动提交失败：' + (ev.detail || ''); }
+      else { text = kind + (ev.detail ? '：' + ev.detail : ''); }
+      return '<li><span class="t">' + esc(when) + '</span><span class="r">' + esc(name) + '</span><span class="' + cls + '">' + esc(text) + '</span></li>';
     }).join('');
   }
 
@@ -551,7 +614,7 @@
     Array.prototype.forEach.call(document.querySelectorAll('.pane'), function (p) {
       p.hidden = p.getAttribute('data-pane') !== tab;
     });
-    if (tab === 'log') loadLog();
+    if (tab === 'log') { renderBlockers(); renderActivity(); loadLog(); }
   });
 
   el('save').addEventListener('click', async function () {
@@ -723,6 +786,24 @@
   el('projList').addEventListener('input', onProjEdit);
   el('projList').addEventListener('change', onProjEdit);
 
+  // 活动页的「收尾」按钮：结束外部自动化留下的运行标记，不做别的状态改写
+  el('blockList').addEventListener('click', async function (e) {
+    var btn = e.target && e.target.closest ? e.target.closest('button[data-endmarker]') : null;
+    if (!btn) return;
+    btn.disabled = true;
+    try {
+      await api('/api/marker', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: btn.getAttribute('data-endmarker'), token: btn.getAttribute('data-token') })
+      });
+      setMsg('运行标记已收尾，下一轮会按现状提醒', 'ok');
+      await loadAll();
+    } catch (err) {
+      btn.disabled = false;
+      setMsg('收尾失败：' + err.message, 'err');
+    }
+  });
+
   el('projList').addEventListener('click', function (e) {
     var gate = e.target.getAttribute && e.target.getAttribute('data-gate');
     if (gate !== null && gate !== undefined) { fixGate(Number(gate)); return; }
@@ -734,7 +815,7 @@
     renderFound();
   });
 
-  el('logBtn').addEventListener('click', loadLog);
+  el('logBtn').addEventListener('click', function () { loadAll(); loadLog(); });
 
   ['mode', 'idleMinutes'].forEach(function (id) {
     el(id).addEventListener('input', function () { state.dirty = true; });

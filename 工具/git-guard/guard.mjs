@@ -85,6 +85,68 @@ function isUntrackedWorktree(repo, name, trackedPaths) {
 function output(value) { console.log(JSON.stringify(value, null, 2)); }
 function save(name, value) { fs.mkdirSync(state, { recursive: true }); const tmp = path.join(state, `${name}.${crypto.randomUUID()}.tmp`); fs.writeFileSync(tmp, JSON.stringify(value)); fs.renameSync(tmp, path.join(state, name)); }
 function load(name, fallback = null) { try { return JSON.parse(fs.readFileSync(path.join(state, name), 'utf8')); } catch (e) { if (e.code === 'ENOENT') return fallback; throw e; } }
+
+// ── 活动记录 ────────────────────────────────────────────────
+// 状态目录里的 append-only JSONL：面板「活动」页靠它回答「刚刚发生了什么」。
+// 提交、弹窗、跳过、稍后、作废、运行标记、清理、失败都会记一条；写入失败不能影响主流程。
+function activityPath() { return path.join(state, 'activity.jsonl'); }
+export function appendActivity(event) {
+  try {
+    fs.mkdirSync(state, { recursive: true });
+    fs.appendFileSync(activityPath(), JSON.stringify({ time: new Date().toISOString(), ...event }) + '\n', 'utf8');
+  } catch (e) {}
+}
+export function readActivity(limit = 200) {
+  try {
+    const lines = fs.readFileSync(activityPath(), 'utf8').split('\n').filter(Boolean);
+    const items = [];
+    for (const line of lines.slice(-Math.max(1, limit))) { try { items.push(JSON.parse(line)); } catch (e) {} }
+    return items.reverse();               // 新的在前，界面直接渲染
+  } catch (e) { return []; }
+}
+// 运行标记是「外部自动化占住这个仓库」的闸：一直没有 end 就会永远挡住提醒。
+// 超过这个时长只标成「疑似残留」提示用户，不自动删——删闸是安全动作，得人点。
+const STALE_MARKER_HOURS = 12;
+function fmtWhen(ms) { const d = new Date(ms), two = n => String(n).padStart(2, '0'); return `${d.getMonth() + 1}-${d.getDate()} ${two(d.getHours())}:${two(d.getMinutes())}`; }
+function fmtSpan(hours) {
+  if (hours >= 24) return `${Math.floor(hours / 24)} 天 ${Math.round(hours % 24)} 小时`;
+  if (hours >= 1) return `${Math.round(hours)} 小时`;
+  return `${Math.max(1, Math.round(hours * 60))} 分钟`;   // 刚开始的标记不能说成「已 1 小时」
+}
+// 面板「现在为什么没提醒」：把静默挡在路上的东西逐条说出来。
+// 只读状态目录，不拉 git 进程（仓库快照由调用方算好传进来）。
+export function stateBlockers(repo, view, options = {}) {
+  const now = Date.now(), out = [], repoId = repoKey(repo);
+  let runs = {};
+  try { runs = load(runName(repo), {}) || {}; } catch (e) {}
+  for (const [token, info] of Object.entries(runs)) {
+    const started = info && info.started ? Date.parse(info.started) : NaN;
+    const hours = Number.isFinite(started) ? Math.max(0, (now - started) / 3600000) : null;
+    out.push({
+      kind: 'marker', token: token, started: info && info.started || null, hours: hours,
+      stale: hours !== null && hours >= STALE_MARKER_HOURS,
+      short: '运行标记未结束',
+      text: '运行标记 ' + token + ' 未结束' + (hours !== null ? '（已 ' + fmtSpan(hours) + '）' : '') + '，提交和提醒都会被它挡住'
+    });
+  }
+  try { if (fs.existsSync(path.join(state, transactionName(repo)))) out.push({ kind: 'gate', short: '提交未收尾', text: '上次提交收尾没做完，事务门禁还在；先处理掉才会恢复提醒' }); } catch (e) {}
+  try { if (load('recovery-' + repoId + '.json')) out.push({ kind: 'recovery', short: '需人工核对', text: '存在提交恢复记录：说明那笔提交的树或父提交与授权不一致，必须人工核对' }); } catch (e) {}
+  let snooze = null;
+  try { snooze = load('snooze-' + repoId + '.json', null); } catch (e) {}
+  if (snooze && Number.isFinite(snooze.until) && now < snooze.until) out.push({ kind: 'snooze', until: snooze.until, short: '稍后提醒中', text: '你选了「稍后提醒」，' + fmtWhen(snooze.until) + ' 前完全不处理' });
+  if (view && view.version) {
+    let skipped = {}, rejected = {};
+    try { skipped = load('skip-' + repoId + '.json', {}) || {}; } catch (e) {}
+    try { rejected = load('cooldown-' + repoId + '.json', {}) || {}; } catch (e) {}
+    if (skipped[view.version]) out.push({ kind: 'skip', short: '本次不提交', text: '这个版本你选过「本次不提交」；文件再变才会重新提醒' });
+    const at = rejected[view.version];
+    if (Number.isFinite(at)) {
+      const until = at + (Number(options.cooldownSeconds) || 7200) * 1000;
+      if (now < until) out.push({ kind: 'cooldown', until: until, short: '冷却中', text: '提醒窗口关过了，' + fmtWhen(until) + ' 之后才会再提醒' });
+    }
+  }
+  return out;
+}
 // 钩子不能缓存：core.hooksPath 和钩子文件都可能在同一进程内被改动（测试和用户都会这么干），
 // 缓存会让「装了 pre-commit 却没被拦住」这种安全判断失真。
 function hooks(repo) {
@@ -315,6 +377,7 @@ export function clearRecovery(repo, options = {}) {
   if (report.transactionFile && fs.existsSync(report.transactionFile)) {
     return { ...report, cleared: false, indexError: '事务文件无法删除，门禁仍然有效：' + report.transactionFile };
   }
+  appendActivity({ kind: 'recover', repo: target, repaired: report.indexRepairedPaths || [], kept: report.indexKeptPaths || [] });
   return { ...report, cleared: true, removed: removed };
 }
 function transactionName(repo) { return `transaction-${repoKey(repo)}.json`; }
@@ -329,7 +392,7 @@ export function marker(repo, action, token) {
   try {
     const all = load(name, {});
     if (action === 'begin') all[token] = { started: new Date().toISOString() }; else if (action === 'end') { if (!all[token]) throw new Error('运行标记不存在'); delete all[token]; } else throw new Error('未知标记操作');
-    save(name, all); return { repo, busy: Object.keys(all).length > 0 };
+    save(name, all); appendActivity({ kind: action === 'begin' ? 'marker-begin' : 'marker-end', repo, token }); return { repo, busy: Object.keys(all).length > 0 };
   } finally { fs.unlinkSync(lock); }
 }
 export function createApproval(repo, paths, message = '保存本地修改') {
@@ -475,6 +538,7 @@ export function commit(approval) {
     try { fs.renameSync(lock, index); locked = false; indexPublished = true; }
     catch (e) { throw new Error(`提交 ${id} 已创建，但索引更新失败：${e.message}；未自动回退`); }
     const result = { repo, commit: id, paths: approval.paths, time: new Date().toISOString() }; save(attempt, { status: 'completed', ...result }); save(`result-${repoKey(repo)}.json`, result);
+    appendActivity({ kind: 'commit', repo, commit: id, count: approval.paths.length, message: approval.message, approvalId: approval.id || null });
     fs.unlinkSync(transactionFile); transactionOwned = false; preserve = false; return result;
   } catch (e) {
     if (commitCreated) {
@@ -577,6 +641,7 @@ export function startMonitor(config = {}, notify) {
     }
   }
   fs.mkdirSync(state, { recursive: true });
+  appendActivity({ kind: 'monitor-start', projects: (Array.isArray(config.projects) ? config.projects.filter(p => p && p.enabled !== false).length : 0) });
   const cooldownSeconds = config.cooldownSeconds ?? 7200;
   const tracker = new Tracker((config.idleSeconds ?? 600) * 1000, cooldownSeconds * 1000), watchers = new Map(), open = new Map();
   const warned = new Set(), lastError = new Map();
@@ -615,7 +680,7 @@ export function startMonitor(config = {}, notify) {
       // 窗口还开着，但内容可能已经变了：变了就不接手，让它自己提示失效
       // 记下窗口 PID：它不是本进程的子进程，拿不到 exit 事件，只能靠轮询感知退出，
       // 否则用户关掉旧窗口后 open 永远为真，这个仓库就再也不提醒了。
-      try { validate(a); open.set(a.repo, { ...a, adoptedPid: live.pid }); } catch (e) {}
+      try { validate(a); open.set(a.repo, { ...a, adoptedPid: live.pid, proposedAt: Date.parse(live.time) || Date.now() }); } catch (e) {}
     }
   }
   function invalidate(repo, detail, source) {
@@ -624,7 +689,7 @@ export function startMonitor(config = {}, notify) {
     const why = source || 'unknown';
     // 每次作废都留一行来源，出问题才追得下去：轮询发现内容变了、文件监听、还是解析仓库失败
     if (a) console.error(`[作废] ${repo} 来源=${why} 细节=${detail || '(未记录)'}`);
-    if (a) save(`invalid-${a.id}.json`, { reason: '弹窗期间观察到修改', detail: detail || '', source: why, time: new Date().toISOString() });
+    if (a) { save(`invalid-${a.id}.json`, { reason: '弹窗期间观察到修改', detail: detail || '', source: why, time: new Date().toISOString() }); appendActivity({ kind: 'invalidate', repo, detail: detail || '', source: why }); }
   }
   // 文件监听只用来「提醒去看一眼」，不作最终判决：
   // 它给不出内容，只能证明「这个文件被碰过」，写一遍相同内容也会触发。
@@ -648,23 +713,34 @@ export function startMonitor(config = {}, notify) {
     const item = tracker.items.get(repo);
     // 用当前观测到的版本记拒绝：弹窗打开期间索引可能刷新过，用旧版本记不上冷却。
     const version = item && item.version ? item.version : a.version;
+    const count = Array.isArray(a.changes) ? a.changes.length : null;
     if (code === 3) {
       tracker.skip(repo, version);
       save(`skip-${repoKey(repo)}.json`, item?.skipped || { [version]: true });
+      appendActivity({ kind: 'skip', repo, count: count });
       return;
     }
     if (code === 4) {
       const until = Date.now() + cooldownSeconds * 1000;
       tracker.snooze(repo, until);
       save(`snooze-${repoKey(repo)}.json`, { until });
+      appendActivity({ kind: 'snooze', repo, until: until, count: count });
       return;
     }
+    // 提交成功的窗口退出码也是 0：用 result-<repo>.json 的落盘时间区分，
+    // 否则会把「刚确认提交」也记成一次「直接关窗」，活动页看起来像失败。
+    let committed = false;
+    try { committed = a.proposedAt ? fs.statSync(path.join(state, `result-${repoKey(repo)}.json`)).mtimeMs >= a.proposedAt : false; } catch (e) {}
+    if (!committed) appendActivity({ kind: 'close', repo, count: count });
     tracker.reject(repo, version);
     save(`cooldown-${repoKey(repo)}.json`, item?.rejected || { [version]: Date.now() });
   }
   function propose(repo, s, message) {
     const a = { ...s, message, snoozeText: snoozeLabel(cooldownSeconds), id: crypto.randomUUID() }, f = `approval-${a.id}.json`;
+    // 记下弹窗出现的时刻：窗口退出时靠它和 result-<repo>.json 的落盘时间区分「提交成功」与「直接关窗」。
+    a.proposedAt = Date.now();
     save(f, a); open.set(repo, a);
+    appendActivity({ kind: 'prompt', repo, count: Array.isArray(s.changes) ? s.changes.length : null, approvalId: a.id });
     if (notify) { notify(a, (code) => finishProposal(repo, a, code)); return; }
     const args = ['-NoProfile', '-STA', '-File', path.join(home, 'window.ps1'), '-Approval', path.join(state, f), '-NodeExe', process.execPath];
     // 仅测试用：让弹窗自己按下指定按钮并退出，全程隐藏，避免验证时在屏幕上闪窗
@@ -762,6 +838,7 @@ export function startMonitor(config = {}, notify) {
               warned.add(repo + ':cap');
               console.error(`${repo}: 本次有 ${s.changes.length} 个文件改动，超过自动提交上限 ${AUTO_MAX_FILES}，已改为弹窗确认`);
               recordAutoCommit({ mode, repo, skipped: true, count: s.changes.length, note: `超过自动提交上限 ${AUTO_MAX_FILES}，改为弹窗` });
+              appendActivity({ kind: 'auto-cap', repo, count: s.changes.length });
             }
             propose(repo, s, message);
           } else {
@@ -774,6 +851,7 @@ export function startMonitor(config = {}, notify) {
             } catch (e) {
               if (!warned.has(repo + ':auto-fail')) { warned.add(repo + ':auto-fail'); console.error(`${repo}: 自动提交失败：${e.message}`); }
               recordAutoCommit({ mode, repo, error: e.message, count: s.changes.length });
+              appendActivity({ kind: 'auto-fail', repo, detail: e.message, count: s.changes.length });
               tracker.reject(repo, s.version);
             }
           }
@@ -789,7 +867,7 @@ export function startMonitor(config = {}, notify) {
   const stateWatcher = fs.watch(state, (event, name) => { if (/^run-.*\.json$/.test(String(name))) requestCheck(); });
   stateWatcher.on('error', () => { tracker.items.clear(); });
   round(); timer = setInterval(round, (config.pollSeconds ?? 30) * 1000);
-  return { tracker, check: round, close() { stopped = true; clearInterval(timer); clearTimeout(wake); stateWatcher.close(); for (const w of watchers.values()) w.close(); } };
+  return { tracker, check: round, close() { stopped = true; appendActivity({ kind: 'monitor-stop' }); clearInterval(timer); clearTimeout(wake); stateWatcher.close(); for (const w of watchers.values()) w.close(); } };
 }
 function arg(name, fallback) { const i = process.argv.indexOf(name); return i < 0 ? fallback : process.argv[i + 1]; }
 async function main() {
